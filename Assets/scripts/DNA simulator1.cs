@@ -1,27 +1,100 @@
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Events;
-using UnityEngine.UI;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
 
 /// <summary>
-/// Spawns a stacked, twisting DNA strand from prefabs, with optional base pairs (A-T, C-G)
-/// and optional interior nucleotide elements (A, T, C, G) placed inside each base half.
+/// Spawns a stacked, twisting DNA strand from prefabs, with optional base pairs (A-T, C-G),
+/// optional interior nucleotide elements (A, T, C, G) placed inside each base half, sugar and
+/// phosphate pieces, and independent LineRenderer "bond lines" per pair orientation.
 /// Each of the four pair orientations (A-T, T-A, C-G, G-C) can have its own interior-element
-/// rotation and interior-elemnt distance override, so they can be styled independently even
-/// when they share the same bases. Every pair gets its own random base, and the sequence is
+/// rotation, interior-element distance override and its own list of bond lines (any number,
+/// each with its own A/B coordinates). Every pair gets its own random base, and the sequence is
 /// cached so it only re-rolls when count / pairsPerStep / pairHeightOffset change. Everything
 /// is built in this object's local space, so you can move / rotate / scale freely.
 ///
-/// GAME MODE (new): call GameMode() (Context Menu or from code, in Play Mode) to start a
-/// base-pairing mini-game on the generated DNA. See the "=== GAME MODE ===" inspector section.
+/// DNA Animation (Play Mode): base pairs fall along the strand's local Y axis, spin around it,
+/// are removed below the bottom boundary and replaced by new random complementary pairs at the top.
+/// Pairs respawned at the top can use a FIXED start rotation (see "Fixed Spawn Rotation"), and
+/// that fixed rotation can alternate an extra 180 degrees between successive respawns.
+///
+/// EVENT: PairDeleted(leftLetter, rightLetter) is raised every time a pair is deleted at the bottom.
 /// </summary>
 [DisallowMultipleComponent]
-public class DNASimulator2 : MonoBehaviour
+public class DNAReplicationSimulator : MonoBehaviour
 {
+    /// <summary>One bond line, authored in PAIR-PIVOT local space.</summary>
+    [System.Serializable]
+    public class BondLine
+    {
+        [Tooltip("Start point (A) in pair-pivot local space. The pivot's X axis runs from the left base to the right base.")]
+        public Vector3 startA = new Vector3(-0.2f, 0f, 0f);
+        [Tooltip("End point (B) in pair-pivot local space.")]
+        public Vector3 endB = new Vector3(0.2f, 0f, 0f);
+        [Tooltip("Draw this line as a dashed line (dash / gap lengths are set in the Bond Lines section).")]
+        public bool dashed = true;
+
+        public BondLine() { }
+        public BondLine(Vector3 a, Vector3 b, bool dashed = true) { startA = a; endB = b; this.dashed = dashed; }
+    }
+
+    /// <summary>A single connector line (sugar -> base, sugar -> phosphate, phosphate -> next sugar)
+    /// drawn on every base half. Endpoints are the two pieces' positions plus an optional offset in
+    /// each piece's OWN local space. Flipped pairs (odd pairs when Alternating Flip is on) can use
+    /// their own set of offsets.</summary>
+    [System.Serializable]
+    public class LinkLine
+    {
+        public bool enabled = true;
+        public bool dashed = false;
+        public Color color = Color.white;
+        [Min(0f)] public float width = 0.03f;
+
+        [Tooltip("Sugar -> base line only. If on, the line's END snaps to the closest point on the base half's " +
+                 "mesh bounds (toward the sugar) instead of the base pivot. The 'To' offsets are then added " +
+                 "on top of that surface point, in the base half's local space.")]
+        public bool snapToTargetSurface = false;
+
+        [Header("Normal pairs")]
+        [Tooltip("LEFT side: offset of the line's start, in the FROM piece's local space (rotation + scale applied).")]
+        public Vector3 fromOffsetLeft = Vector3.zero;
+        [Tooltip("LEFT side: offset of the line's end, in the TO piece's local space (rotation + scale applied).")]
+        public Vector3 toOffsetLeft = Vector3.zero;
+        [Tooltip("RIGHT side: offset of the line's start, in the FROM piece's local space.")]
+        public Vector3 fromOffsetRight = Vector3.zero;
+        [Tooltip("RIGHT side: offset of the line's end, in the TO piece's local space.")]
+        public Vector3 toOffsetRight = Vector3.zero;
+
+        [Header("Flipped pairs (odd pairs when Alternating Flip is on)")]
+        [Tooltip("If off, flipped pairs reuse the normal offsets above (old behaviour).")]
+        public bool useFlippedOffsets = false;
+        public Vector3 fromOffsetLeftFlipped = Vector3.zero;
+        public Vector3 toOffsetLeftFlipped = Vector3.zero;
+        public Vector3 fromOffsetRightFlipped = Vector3.zero;
+        public Vector3 toOffsetRightFlipped = Vector3.zero;
+
+        public Vector3 GetFrom(bool left, bool flipped)
+        {
+            if (flipped && useFlippedOffsets) return left ? fromOffsetLeftFlipped : fromOffsetRightFlipped;
+            return left ? fromOffsetLeft : fromOffsetRight;
+        }
+
+        public Vector3 GetTo(bool left, bool flipped)
+        {
+            if (flipped && useFlippedOffsets) return left ? toOffsetLeftFlipped : toOffsetRightFlipped;
+            return left ? toOffsetLeft : toOffsetRight;
+        }
+    }
+
+    /// <summary>Spin direction as seen from above (looking down the strand's local Y axis).</summary>
+    public enum SpinDirection { Clockwise, CounterClockwise }
+
+    // ------------------------------------------------------------------ Events
+    /// <summary>Raised every time a base pair is deleted at the bottom boundary.
+    /// Arguments: (left base letter, right base letter), e.g. ('A', 'T').</summary>
+    public event System.Action<char, char> PairDeleted;
+
     // ------------------------------------------------------------------ Strand
     [Header("Prefab - DNA Strand")]
     [Tooltip("The backbone strand prefab. Spawned once per step.")]
@@ -103,6 +176,10 @@ public class DNASimulator2 : MonoBehaviour
     [Tooltip("If enabled, sugar and phosphate on every OTHER base pair use the Flipped values " +
              "below instead of the normal ones. Pair 0 = normal, pair 1 = flipped, pair 2 = normal, ...")]
     public bool alternateSugarPhosphateFlip = true;
+    [Tooltip("If enabled, on flipped pairs the phosphate is carried along with its sugar: it keeps its normal " +
+             "position/rotation relative to the sugar, so whatever flip the sugar gets, the phosphate gets too. " +
+             "The 'Flipped Phosphate' values below are then ignored (they are still used if no sugar is spawned).")]
+    public bool phosphateFollowsSugarFlip = true;
 
     [Header("Flipped Sugar (used on odd pairs when Alternating Flip is on)")]
     [Tooltip("Flipped position offset for the LEFT sugar (base half's local space).")]
@@ -186,6 +263,68 @@ public class DNASimulator2 : MonoBehaviour
     [Tooltip("Element Distance for G-C pairs. 0 = use the default Element Distance above.")]
     [Min(0f)] public float elementDistanceGC = 0f;
 
+    // ------------------------------------------------------------------ Bond lines
+    [Header("Bond Lines (LineRenderer, independent of base prefabs)")]
+    [Tooltip("Spawn LineRenderer bond lines for every base pair.")]
+    public bool spawnBondLines = true;
+    [Tooltip("Material for all bond lines. If empty, a basic Sprites/Default material is used " +
+             "(assign your own for builds, since Shader.Find can be stripped).")]
+    public Material bondLineMaterial;
+    public Color bondLineColor = Color.white;
+    [Min(0f)] public float bondLineWidth = 0.03f;
+    [Tooltip("View = lines always face the camera. TransformZ = lines face the pair pivot's Z axis.")]
+    public LineAlignment bondLineAlignment = LineAlignment.View;
+    [Min(0)] public int bondLineCapVertices = 0;
+
+    [Header("Dashed Line Settings (bond lines + sugar links)")]
+    [Tooltip("Length of each dash, in pair-pivot local units. Dashes are built from short separate LineRenderers.")]
+    [Min(0.001f)] public float dashLength = 0.06f;
+    [Tooltip("Gap between dashes, in pair-pivot local units.")]
+    [Min(0f)] public float dashGap = 0.04f;
+    [Tooltip("Safety cap on dashes per line (each dash is one LineRenderer).")]
+    [Min(1)] public int maxDashesPerLine = 40;
+
+    [Tooltip("Bond lines for A-T pairs (A on the left). Size = number of lines. " +
+             "Coordinates are in PAIR-PIVOT local space (X runs left base -> right base).")]
+    public List<BondLine> bondLinesAT = new List<BondLine>
+    {
+        new BondLine(new Vector3(-0.2f, 0.05f, 0f), new Vector3(0.2f, 0.05f, 0f)),
+        new BondLine(new Vector3(-0.2f, -0.05f, 0f), new Vector3(0.2f, -0.05f, 0f)),
+    };
+    [Tooltip("Bond lines for T-A pairs (T on the left).")]
+    public List<BondLine> bondLinesTA = new List<BondLine>
+    {
+        new BondLine(new Vector3(-0.2f, 0.05f, 0f), new Vector3(0.2f, 0.05f, 0f)),
+        new BondLine(new Vector3(-0.2f, -0.05f, 0f), new Vector3(0.2f, -0.05f, 0f)),
+    };
+    [Tooltip("Bond lines for C-G pairs (C on the left).")]
+    public List<BondLine> bondLinesCG = new List<BondLine>
+    {
+        new BondLine(new Vector3(-0.2f, 0.08f, 0f), new Vector3(0.2f, 0.08f, 0f)),
+        new BondLine(new Vector3(-0.2f, 0f, 0f), new Vector3(0.2f, 0f, 0f)),
+        new BondLine(new Vector3(-0.2f, -0.08f, 0f), new Vector3(0.2f, -0.08f, 0f)),
+    };
+    [Tooltip("Bond lines for G-C pairs (G on the left).")]
+    public List<BondLine> bondLinesGC = new List<BondLine>
+    {
+        new BondLine(new Vector3(-0.2f, 0.08f, 0f), new Vector3(0.2f, 0.08f, 0f)),
+        new BondLine(new Vector3(-0.2f, 0f, 0f), new Vector3(0.2f, 0f, 0f)),
+        new BondLine(new Vector3(-0.2f, -0.08f, 0f), new Vector3(0.2f, -0.08f, 0f)),
+    };
+
+    // ------------------------------------------------------------------ Sugar links
+    [Header("Sugar Link Lines (share Material / Alignment / Caps from Bond Lines)")]
+    [Tooltip("Line from each SUGAR to the base half (A / T / C / G) it belongs to. " +
+             "FROM = sugar, TO = base half.")]
+    public LinkLine sugarToBaseLine = new LinkLine { snapToTargetSurface = true };
+    [Tooltip("Line from each SUGAR to the PHOSPHATE next to it. FROM = sugar, TO = phosphate.")]
+    public LinkLine sugarToPhosphateLine = new LinkLine { color = new Color(1f, 0.8f, 0.2f) };
+
+    [Tooltip("Line from each PHOSPHATE to the SUGAR of the NEXT pair on the same side, forming the " +
+             "continuous sugar-phosphate backbone chain. FROM = phosphate (this pair), TO = sugar (next pair). " +
+             "The FROM pair's flip drives the phosphate offsets, the TO pair's flip drives the sugar offsets.")]
+    public LinkLine phosphateToNextSugarLine = new LinkLine { color = new Color(0.3f, 0.85f, 1f) };
+
     // ------------------------------------------------------------------ Spawn / stacking
     [Header("Spawn")]
     [Tooltip("Local-space offset of the first step.")]
@@ -196,13 +335,56 @@ public class DNASimulator2 : MonoBehaviour
     public Vector3 baseRotation = new Vector3(-90f, 0f, 0f);
 
     [Header("Count & Stacking")]
-    [Min(1)] public int count = 1;
+    [Tooltip("Number of strand steps. 0 is allowed: nothing is spawned (no strand, no base pairs).")]
+    [Min(0)] public int count = 1;
     [Tooltip("Rotation applied to each strand piece after the first (multiplied by index).")]
     public Vector3 rotationOffsetPerStep = new Vector3(0f, 36f, 0f);
     [Tooltip("Extra gap between stacked pieces.")]
     public float stackGap = 0f;
     [Tooltip("0 = measure the strand prefab automatically (taking Base Rotation into account). >0 = use this height.")]
     [Min(0f)] public float stepHeightOverride = 0f;
+
+    // ------------------------------------------------------------------ DNA Animation
+    [Header("DNA Animation")]
+    [Tooltip("Base pairs slowly fall along the strand's local Y axis (Play Mode only).")]
+    public bool enableFallingAnimation = true;
+    [Tooltip("Falling speed in local units per second. 0 = stopped. Negative values are clamped to 0. " +
+             "Can be changed while the game is running.")]
+    [Min(0f)] public float fallingSpeed = 0.25f;
+
+    [Tooltip("Base pairs spin around the strand's local Y axis while they fall.")]
+    public bool enableRotationAnimation = true;
+    [Tooltip("Rotation speed in degrees per second. 0 = no additional rotation. Independent of Falling Speed.")]
+    [Min(0f)] public float rotationSpeed = 20f;
+    [Tooltip("Spin direction as seen from above the strand.")]
+    public SpinDirection rotationDirection = SpinDirection.Clockwise;
+
+    [Tooltip("If on, a new random complementary base pair spawns at the top whenever there is room, " +
+             "so the strand looks endless. If off, pairs are only removed at the bottom.")]
+    public bool enableAutomaticRespawning = true;
+
+    [Header("Fixed Spawn Rotation (pairs respawned at the top)")]
+    [Tooltip("ON = every pair that respawns at the top starts with EXACTLY the rotation below (pair pivot, " +
+             "local space of this object), no matter how far the strand has spun or which pair index it is. " +
+             "From there it spins normally. OFF = old behaviour (rotation depends on the pair index and spin).")]
+    public bool useFixedSpawnRotation = true;
+    [Tooltip("Euler rotation of the pair pivot at the moment it spawns at the top.")]
+    public Vector3 fixedSpawnRotation = Vector3.zero;
+    [Tooltip("If ON, respawned pairs alternate: the 1st spawn (even serial) uses Fixed Spawn Rotation rotated " +
+             "an extra 180 degrees around the strand's local Y; the 2nd spawn (odd serial) uses Fixed Spawn " +
+             "Rotation exactly; and so on.")]
+    public bool alternateFixedSpawnRotation180 = true;
+
+    [Header("DNA Animation Bounds")]
+    [Tooltip("ON = the Top Spawn Height / Bottom Despawn Height fields below are IGNORED and the bounds are " +
+             "taken from the initially generated pairs. TURN THIS OFF to use your own heights.")]
+    public bool useAutomaticBounds = true;
+    [Tooltip("Local-space height (this object's space) at which new pairs enter. Only used when " +
+             "Use Automatic Bounds is OFF. In that mode the initial strand also fills the range up to this height.")]
+    public float topSpawnHeight = 10f;
+    [Tooltip("Local-space height below which a pair is removed. Only used when Use Automatic Bounds is OFF. " +
+             "In that mode the initial strand also starts at this height.")]
+    public float bottomDespawnHeight = 0f;
 
     // ------------------------------------------------------------------ Options
     [Header("Options")]
@@ -211,126 +393,12 @@ public class DNASimulator2 : MonoBehaviour
     public bool liveUpdateInEditor = true;
     public bool drawGizmos = true;
 
-    // =================================================================== GAME MODE (inspector)
-    // ------------------------------------------------------------------ General
-    [Header("=== GAME MODE ===")]
-    [Tooltip("Master switch. If off, GameMode() does nothing.")]
-    public bool enableGameMode = true;
-    [Tooltip("If true, Game Mode starts automatically in Start() (this replaces the normal Spawn on start).")]
-    public bool startGameModeOnStart = false;
-    [Tooltip("0 = a different set of missing bases every time. Any other number = the same missing bases every time " +
-             "(for the same sequence).")]
-    public int gameSeed = 0;
-
-    // ------------------------------------------------------------------ Camera
-    [Header("Game Mode - Camera")]
-    [Tooltip("Camera used for gameplay. If empty, Camera.main is used.")]
-    public Camera gameCamera;
-    [Min(0f)] public float cameraMoveDuration = 1f;
-    [Tooltip("Camera position relative to the DNA center, in this object's LOCAL space. " +
-             "The default (0,0,-10) views the DNA from the front (looking along +Z).")]
-    public Vector3 gameCameraOffset = new Vector3(0f, 0f, -10f);
-
-    // ------------------------------------------------------------------ Feedback
-    [Header("Game Mode - Feedback")]
-    public Color correctFlashColor = Color.green;
-    public Color wrongFlashColor = Color.red;
-    [Min(0f)] public float correctFlashDuration = 0.5f;
-    [Min(0f)] public float wrongFlashDuration = 0.5f;
-    [Tooltip("Tint the visible partner base so the player can see which pair is the current target.")]
-    public bool highlightActiveTarget = true;
-    public Color targetHighlightColor = new Color(1f, 0.92f, 0.2f);
-
-    // ------------------------------------------------------------------ Movement
-    [Header("Game Mode - Section Movement")]
-    [Tooltip("How far (in this object's local units) the section moves down after each completed base.")]
-    [Min(0f)] public float strandMoveDownDistance = 1f;
-    [Min(0f)] public float strandMoveDuration = 0.5f;
-
-    public enum SectionMoveMode
-    {
-        /// <summary>Only the section that contains the completed base moves down.</summary>
-        CurrentSectionOnly,
-        /// <summary>The completed base's section AND every section after it (Section 2, then 3...) moves down.</summary>
-        CurrentAndFollowingSections,
-        /// <summary>The whole generated DNA moves down.</summary>
-        WholeDNA,
-    }
-    public SectionMoveMode sectionMoveMode = SectionMoveMode.CurrentSectionOnly;
-
-    // ------------------------------------------------------------------ Sections
-    [Header("Game Mode - Sections")]
-    [Tooltip("ON: the pairs are divided evenly between the sections (Start Pair Index / Pair Count are ignored). " +
-             "OFF: each section uses its own Start Pair Index and Pair Count.")]
-    public bool autoDivideSections = true;
-    [Tooltip("Only used when Auto Divide is ON. True = Section 1 is at the TOP of the DNA and the last section at " +
-             "the bottom. False = Section 1 at the bottom.")]
-    public bool section1AtTop = true;
-
-    /// <summary>Settings for one game section (stage).</summary>
-    [System.Serializable]
-    public class GameSection
-    {
-        public string name = "Section";
-        [Tooltip("Manual mode only: first pair index of this section (pair 0 is the bottom pair).")]
-        [Min(0)] public int startPairIndex = 0;
-        [Tooltip("Manual mode only: how many pairs the section has. End index = Start + Pair Count - 1.")]
-        [Min(0)] public int pairCount = 6;
-        [Tooltip("How many bases are missing in this section. 0 = fully paired (Stage 1).")]
-        [Min(0)] public int missingBases = 0;
-        [Tooltip("Distance this section moves down after a completed base. Negative = use the global " +
-                 "Strand Move Down Distance.")]
-        public float moveDownDistanceOverride = -1f;
-
-        /// <summary>Last pair index (inclusive) when using manual ranges.</summary>
-        public int EndPairIndex => startPairIndex + pairCount - 1;
-    }
-
-    public List<GameSection> gameSections = new List<GameSection>
-    {
-        new GameSection { name = "Section 1 (Complete)",           startPairIndex = 0,  pairCount = 6, missingBases = 0 },
-        new GameSection { name = "Section 2 (Partially Complete)", startPairIndex = 6,  pairCount = 6, missingBases = 3 },
-        new GameSection { name = "Section 3 (Many Missing)",       startPairIndex = 12, pairCount = 6, missingBases = 5 },
-    };
-
-    // ------------------------------------------------------------------ Buttons
-    [Header("Game Mode - UI Buttons")]
-    [Tooltip("Automatically hook the four buttons' onClick to SubmitBaseAnswer().")]
-    public bool autoConnectButtons = true;
-    public Button buttonC;
-    public Button buttonA;
-    public Button buttonT;
-    public Button buttonG;
-    [Tooltip("Optional. Activated when Game Mode starts and deactivated by ExitGameMode().")]
-    public GameObject buttonsPanel;
-    [Tooltip("Also flash the UI button green / red.")]
-    public bool flashButtons = true;
-
-    // ------------------------------------------------------------------ Events
-    [Header("Game Mode - Events")]
-    public UnityEvent OnGameStarted = new UnityEvent();
-    public UnityEvent OnAnswerCorrect = new UnityEvent();
-    public UnityEvent OnAnswerWrong = new UnityEvent();
-    public UnityEvent OnGameCompleted = new UnityEvent();
-
-    // ------------------------------------------------------------------ Game state
-    /// <summary>Internal state of the mini-game.</summary>
-    public enum GameState
-    {
-        NotStarted,
-        MovingCamera,
-        Playing,
-        FlashingCorrect,
-        FlashingWrong,
-        MovingSection,
-        Completed,
-    }
-
     // ------------------------------------------------------------------ Runtime state
     private const string ContainerName = "__DNA_Generated";
     private const string PairPivotName = "__PairPivot";
-    private const string SectionRootName = "__Section";
     private const string Bases = "ATCG";
+    private const int MaxPairsPerFrame = 32;
+    private const int MaxInitialPairs = 2000;
 
     private readonly List<GameObject> spawned = new();
     private Transform _container;
@@ -348,101 +416,98 @@ public class DNASimulator2 : MonoBehaviour
     private int _heightKey;
     private float _cachedHeight = 1f;
 
+    // Fallback bond line material (only created if none is assigned)
+    private static Material _fallbackBondMaterial;
+
     private static readonly Color GizmoPairColor = new Color(1f, 0.2f, 1f); // magenta preview
 
-    // ------------------------------------------------------------------ Game runtime data
-    /// <summary>Runtime (resolved) version of a GameSection.</summary>
-    private class SectionRuntime
+    // --- Animation state ---
+    /// <summary>Runtime record of one live base pair.</summary>
+    private sealed class PairRuntime
     {
-        public int index;
-        public string name;
-        public int start;   // first pair index (inclusive)
-        public int end;     // last pair index (inclusive); end < start means empty
-        public int missing;
-        public float moveDistance; // negative = use global
-        public Transform root;     // logical parent of this section's pair pivots + strand pieces
+        public int serial;           // monotonically increasing, never reused
+        public Transform pivot;
+        public Vector3 restPos;      // pivot position with no fall applied
+        public Quaternion restRot;   // pivot rotation with no spin applied
+        public char leftLetter;      // base letter on the left half
+        public char rightLetter;     // base letter on the right half (complement of leftLetter)
     }
 
-    /// <summary>One missing base: everything needed to spawn a base into the exact slot later, using the
-    /// same placement values the normal generator used.</summary>
-    private class MissingSlot
+    private readonly List<PairRuntime> _pairs = new();   // ascending serial (bottom -> top)
+    private bool _animReady;
+    private int _nextSerial;
+    private float _fallOffset;       // total distance fallen (local units)
+    private float _spinAngle;        // accumulated spin (degrees, wrapped to 0..360)
+    private float _autoBottom, _autoTop;
+    private int _warnedMask;
+    private bool _warnedBounds;
+
+    private HalfRuntimeInfo _topL, _topR;                // info of the highest live pair (for backbone links)
+    private bool _haveTop;
+
+    // Reusable buffers (avoid per-frame allocations)
+    private readonly List<Transform> _tmpTransforms = new();
+    private readonly HashSet<GameObject> _removeSet = new();
+    private System.Predicate<GameObject> _removePredicate;
+
+    /// <summary>Info about one spawned base half, used to build cross-pair lines
+    /// (phosphate of this pair -> sugar of the next pair).</summary>
+    private struct HalfRuntimeInfo
     {
-        public int pairIndex;
-        public int sectionIndex;
-        public bool isLeft;
-        public char correctLetter;   // the letter that belongs in the missing slot
-        public char visibleLetter;   // the letter already shown on the other half
-        public Transform parent;     // the pair pivot
-        public Vector3 localPos;
-        public float side;
-        public float elemDist;
-        public Quaternion baseRot;
-        public Quaternion elemRot;
+        public bool hasSugar;
+        public bool hasPhos;
         public bool flipped;
-        public GameObject visibleGo; // the base half that IS present
-        public GameObject currentGo; // whatever is currently spawned in the missing slot (may be null)
+        public bool isLeft;
+        public Transform pivot;
+        public Vector3 sugarPos;
+        public Quaternion sugarRot;
+        public Vector3 phosPos;
+        public Quaternion phosRot;
+        // Rest pose of the pivot (no fall / spin applied) - motion-independent.
+        public Vector3 restPos;
+        public Quaternion restRot;
     }
 
-    /// <summary>Saved original color of one material property so it can be restored exactly.</summary>
-    private class TintRecord
-    {
-        public Material mat;
-        public int propId;
-        public Color original;
-    }
-
-    private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
-    private static readonly int ColorId = Shader.PropertyToID("_Color");
-
-    private GameState _state = GameState.NotStarted;
-    private bool _gameModeActive;
-    private bool _buildingGame; // true only while GameMode() is respawning the DNA
-
-    private readonly List<SectionRuntime> _sections = new();
-    private readonly Dictionary<int, int> _missingSidePlan = new();   // pairIndex -> -1 (left) / +1 (right)
-    private readonly Dictionary<int, MissingSlot> _slots = new();     // pairIndex -> slot
-    private readonly List<MissingSlot> _targets = new();
-    private int _targetIndex = -1;
-    private MissingSlot _currentTarget;
-
-    private readonly Dictionary<GameObject, List<TintRecord>> _tints = new();
-    private readonly Dictionary<Graphic, Color> _buttonOriginals = new();
-
-    private UnityAction _clickC, _clickA, _clickT, _clickG;
-
-    private bool _camSaved;
-    private Vector3 _camOrigPos;
-    private Quaternion _camOrigRot;
-    private Camera _camUsed;
-
-    /// <summary>All spawned objects (strand, pair pivots, base halves, elements, sugars, phosphates).</summary>
+    /// <summary>All spawned objects (strand, pair pivots, base halves, elements, sugars, phosphates, bond lines).</summary>
     public IReadOnlyList<GameObject> Spawned => spawned;
 
-    /// <summary>Current Game Mode state.</summary>
-    public GameState CurrentGameState => _state;
-    /// <summary>True between GameMode() and ExitGameMode() / respawn.</summary>
-    public bool IsGameModeActive => _gameModeActive;
+    /// <summary>Height of one strand step (measured or overridden), used by DNAStraightReplicationSimulator
+    /// so both strands use identical pair spacing.</summary>
+    public float StepHeight => GetStepHeight();
 
     // =================================================================== Unity callbacks
     private void Start()
     {
-        if (startGameModeOnStart) GameMode();
-        else if (spawnOnStart) Spawn();
+        if (spawnOnStart) Spawn();
     }
 
-    private void OnEnable()
+    private void Update()
     {
-        ConnectButtons();
-    }
+        if (!Application.isPlaying || !_animReady || _container == null) return;
 
-    private void OnDisable()
-    {
-        DisconnectButtons();
+        float dt = Time.deltaTime;
+        bool moved = false;
+
+        if (enableFallingAnimation && fallingSpeed > 0f)
+        {
+            _fallOffset += Mathf.Max(0f, fallingSpeed) * dt;
+            moved = true;
+        }
+
+        if (enableRotationAnimation && rotationSpeed > 0f)
+        {
+            float dir = rotationDirection == SpinDirection.Clockwise ? 1f : -1f;
+            _spinAngle = Mathf.Repeat(_spinAngle + dir * rotationSpeed * dt, 360f);
+            moved = true;
+        }
+
+        if (moved) ApplyMotion();
+        if (enableFallingAnimation) CyclePairs();
     }
 
     private void OnValidate()
     {
-        count = Mathf.Max(1, count);
+        count = Mathf.Max(0, count);
         pairsPerStep = Mathf.Max(0.01f, pairsPerStep);
         stepHeightOverride = Mathf.Max(0f, stepHeightOverride);
         elementDistance = Mathf.Max(0f, elementDistance);
@@ -450,13 +515,13 @@ public class DNASimulator2 : MonoBehaviour
         elementDistanceTA = Mathf.Max(0f, elementDistanceTA);
         elementDistanceCG = Mathf.Max(0f, elementDistanceCG);
         elementDistanceGC = Mathf.Max(0f, elementDistanceGC);
-
-        // Game Mode clamps
-        cameraMoveDuration = Mathf.Max(0f, cameraMoveDuration);
-        correctFlashDuration = Mathf.Max(0f, correctFlashDuration);
-        wrongFlashDuration = Mathf.Max(0f, wrongFlashDuration);
-        strandMoveDownDistance = Mathf.Max(0f, strandMoveDownDistance);
-        strandMoveDuration = Mathf.Max(0f, strandMoveDuration);
+        bondLineWidth = Mathf.Max(0f, bondLineWidth);
+        bondLineCapVertices = Mathf.Max(0, bondLineCapVertices);
+        dashLength = Mathf.Max(0.001f, dashLength);
+        dashGap = Mathf.Max(0f, dashGap);
+        maxDashesPerLine = Mathf.Max(1, maxDashesPerLine);
+        fallingSpeed = Mathf.Max(0f, fallingSpeed);
+        rotationSpeed = Mathf.Max(0f, rotationSpeed);
 
 #if UNITY_EDITOR
         if (!liveUpdateInEditor || Application.isPlaying) return;
@@ -478,13 +543,170 @@ public class DNASimulator2 : MonoBehaviour
     private bool _updateQueued;
 #endif
 
+    // =================================================================== Animation
+    /// <summary>Applies the current fall + spin to every live pair pivot. Pairs spin in place
+    /// around the strand's local Y axis (the pivots sit on that axis), so the helix is preserved.</summary>
+    private void ApplyMotion()
+    {
+        Quaternion spin = Quaternion.AngleAxis(_spinAngle, Vector3.up);
+        Vector3 down = Vector3.down * _fallOffset;
+
+        for (int i = 0; i < _pairs.Count; i++)
+        {
+            PairRuntime pr = _pairs[i];
+            if (pr.pivot == null) continue;
+            pr.pivot.SetLocalPositionAndRotation(pr.restPos + down, spin * pr.restRot);
+        }
+    }
+
+    /// <summary>Returns the active bottom / top heights (this object's local space).
+    /// Manual mode uses the Inspector fields; automatic mode uses the initial strand extents.</summary>
+    private void GetBounds(float step, out float bottom, out float top)
+    {
+        if (!useAutomaticBounds)
+        {
+            bottom = bottomDespawnHeight;
+            top = topSpawnHeight;
+            return;
+        }
+
+        if (_animReady)
+        {
+            bottom = _autoBottom;
+            top = _autoTop;
+            return;
+        }
+
+        ComputeAutoBounds(step, out bottom, out top);
+    }
+
+    private void ComputeAutoBounds(float step, out float bottom, out float top)
+    {
+        float spacing = step / pairsPerStep;
+        float yFirst = spawnPosition.y + pairHeightOffset * step;
+        float yLast = spawnPosition.y + ((TotalPairs - 1) / pairsPerStep + pairHeightOffset) * step;
+        bottom = yFirst - spacing;
+        top = yLast;
+    }
+
+    /// <summary>Copies the automatic bounds into the Top / Bottom height fields as a starting point.
+    /// Right-click the component header to run it.</summary>
+    [ContextMenu("Copy Automatic Bounds To Heights")]
+    public void CopyAutoBoundsToHeights()
+    {
+        float step = GetStepHeight() + stackGap;
+        ComputeAutoBounds(step, out float b, out float t);
+        bottomDespawnHeight = b;
+        topSpawnHeight = t;
+#if UNITY_EDITOR
+        EditorUtility.SetDirty(this);
+#endif
+    }
+
+    /// <summary>Removes pairs that fell below the bottom boundary and, if enabled, spawns new
+    /// ones at the top. Cheap O(1) checks when nothing needs to happen.</summary>
+    private void CyclePairs()
+    {
+        float step = GetStepHeight() + stackGap;
+        GetBounds(step, out float bottom, out float top);
+
+        if (top <= bottom)
+        {
+            if (!_warnedBounds)
+            {
+                _warnedBounds = true;
+                Debug.LogWarning("DNASimulator: Top Spawn Height must be above Bottom Despawn Height - cycling paused.", this);
+            }
+            return;
+        }
+        _warnedBounds = false;
+
+        // --- Remove pairs below the bottom boundary ---
+        bool removed = false;
+        while (_pairs.Count > 0 && _pairs[0].restPos.y - _fallOffset < bottom)
+        {
+            QueueRemoval(_pairs[0]);
+            _pairs.RemoveAt(0);
+            removed = true;
+        }
+        if (removed) FlushRemovals();
+
+        if (!enableAutomaticRespawning) return;
+
+        float spacing = step / pairsPerStep;
+        if (spacing < 1e-4f) return;
+
+        // --- Spawn new pairs at the top while there is room ---
+        for (int guard = 0; guard < MaxPairsPerFrame; guard++)
+        {
+            int serial = _nextSerial;
+            float t = serial / pairsPerStep + pairHeightOffset;
+            float restY = spawnPosition.y + t * step;
+            float currentY = restY - _fallOffset;
+
+            if (currentY > top) break;      // slot is still above the entry height
+
+            _nextSerial++;
+
+            if (currentY < bottom)          // would be removed instantly - skip the slot
+            {
+                _haveTop = false;
+                continue;
+            }
+
+            char letter = Bases[Random.Range(0, Bases.Length)];
+            SpawnPair(serial, letter, step, true);   // runtime respawn -> may use the fixed spawn rotation
+        }
+    }
+
+    private void QueueRemoval(PairRuntime pr)
+    {
+        if (pr.pivot == null) return;
+
+        if (_haveTop && _topL.pivot == pr.pivot) _haveTop = false;
+
+        // Log the deletion using the actual base-pair name (e.g. "A-T"), not the pivot name.
+        Debug.Log($"DNA Pair '{pr.leftLetter}-{pr.rightLetter}' (serial {pr.serial}) deleted.", this);
+
+        // Notify listeners (e.g. DNAStraightReplicationSimulator) BEFORE the pair is destroyed.
+        PairDeleted?.Invoke(pr.leftLetter, pr.rightLetter);
+
+        pr.pivot.GetComponentsInChildren(true, _tmpTransforms);
+        for (int i = 0; i < _tmpTransforms.Count; i++)
+            _removeSet.Add(_tmpTransforms[i].gameObject);
+
+        // Hide immediately; the actual Destroy happens at end of frame.
+        pr.pivot.gameObject.SetActive(false);
+        Destroy(pr.pivot.gameObject);
+        pr.pivot = null;
+    }
+
+    private bool IsRemoved(GameObject go) => go == null || _removeSet.Contains(go);
+
+    private void FlushRemovals()
+    {
+        _removePredicate ??= IsRemoved;
+        spawned.RemoveAll(_removePredicate);
+        _removeSet.Clear();
+    }
+
     // =================================================================== Spawning
     [ContextMenu("Spawn")]
     public void Spawn()
     {
-        ClearSpawned(); // also cancels a running game (unless GameMode() itself is rebuilding)
+        ClearSpawned();
         _heightValid = false;
         _lastHash = ComputeSettingsHash();
+
+        // Reset animation state.
+        _animReady = false;
+        _fallOffset = 0f;
+        _spinAngle = 0f;
+        _nextSerial = 0;
+        _warnedMask = 0;
+        _warnedBounds = false;
+        _haveTop = false;
+        _pairs.Clear();
 
         if (prefab == null)
         {
@@ -499,23 +721,23 @@ public class DNASimulator2 : MonoBehaviour
         _container.SetParent(transform, false);
         MarkTemporary(_container.gameObject);
 
-        // Game Mode: logical section roots that pair pivots + strand pieces get parented to,
-        // so a whole section can be moved without touching the rest of the DNA.
-        if (_gameModeActive) CreateSectionRoots();
-
-        // --- Strand ---
+        // --- Strand (runs zero times when count is 0) ---
         Quaternion baseRot = Quaternion.Euler(baseRotation);
         for (int i = 0; i < count; i++)
         {
             Vector3 pos = spawnPosition + Vector3.up * (i * step);
             Quaternion rot = Quaternion.Euler(rotationOffsetPerStep * i) * baseRot;
-            Transform strandParent = _gameModeActive ? GetSectionRootForStrand(i) : _container;
-            Place(prefab, pos, rot, $"{prefab.name}_{i}", strandParent);
+            Place(prefab, pos, rot, $"{prefab.name}_{i}");
         }
 
-        // --- Base pairs (+ interior elements + sugar + phosphate) ---
-        if (spawnBasePairs)
+        // --- Base pairs (+ interior elements + sugar + phosphate + bond lines) ---
+        // Skipped entirely when count is 0, so the animation never starts and no bounds warning fires.
+        if (spawnBasePairs && count > 0)
+        {
             SpawnBasePairs(step);
+            ComputeAutoBounds(step, out _autoBottom, out _autoTop);
+            _animReady = true;
+        }
     }
 
     /// <summary>Re-rolls the base sequence and respawns. Use this when you want new random bases
@@ -527,7 +749,7 @@ public class DNASimulator2 : MonoBehaviour
         Spawn();
     }
 
-    private int TotalPairs => Mathf.Max(1, Mathf.RoundToInt(count * pairsPerStep));
+    private int TotalPairs => count <= 0 ? 0 : Mathf.Max(1, Mathf.RoundToInt(count * pairsPerStep));
 
     /// <summary>Number of pairs the sequence needs to cover, including any extra slots caused
     /// by a fractional height offset shift. Cached key for the sequence.</summary>
@@ -587,8 +809,7 @@ public class DNASimulator2 : MonoBehaviour
     private bool IsFlippedPair(int pairIndex)
         => alternateSugarPhosphateFlip && (pairIndex & 1) == 1;
 
-    /// <summary>Element Distance to use, taking the per-pattern override into account
-    /// ('\0' = no override, used by the gizmo preview).</summary>
+    /// <summary>Element Distance to use, taking the per-pattern override into account.</summary>
     private float GetElementDistance(char leftLetter)
     {
         float over = leftLetter switch
@@ -602,136 +823,313 @@ public class DNASimulator2 : MonoBehaviour
         return over > 0f ? over : elementDistance;
     }
 
-    /// <summary>Per-pattern extra LOCAL rotation for the interior element on the LEFT half
-    /// (added on top of elementLocalRotation). Returns Vector3.zero for '\0' (gizmo preview).</summary>
+    /// <summary>Per-pattern extra LOCAL rotation for the interior element on the LEFT half.</summary>
     private Vector3 GetElementRotationLeft(char leftLetter) => leftLetter switch
     {
-        'A' => elementRotationAT_L,   // A on left -> A-T pattern
-        'T' => elementRotationTA_L,   // T on left -> T-A pattern
-        'C' => elementRotationCG_L,   // C on left -> C-G pattern
-        'G' => elementRotationGC_L,   // G on left -> G-C pattern
+        'A' => elementRotationAT_L,
+        'T' => elementRotationTA_L,
+        'C' => elementRotationCG_L,
+        'G' => elementRotationGC_L,
         _ => Vector3.zero,
     };
 
-    /// <summary>Per-pattern extra LOCAL rotation for the interior element on the RIGHT half
-    /// (added on top of elementLocalRotation). Returns Vector3.zero for '\0' (gizmo preview).</summary>
+    /// <summary>Per-pattern extra LOCAL rotation for the interior element on the RIGHT half.</summary>
     private Vector3 GetElementRotationRight(char leftLetter) => leftLetter switch
     {
-        'A' => elementRotationAT_R,   // A on left -> A-T pattern, right = T
-        'T' => elementRotationTA_R,   // T on left -> T-A pattern, right = A
-        'C' => elementRotationCG_R,   // C on left -> C-G pattern, right = G
-        'G' => elementRotationGC_R,   // G on left -> G-C pattern, right = C
+        'A' => elementRotationAT_R,
+        'T' => elementRotationTA_R,
+        'C' => elementRotationCG_R,
+        'G' => elementRotationGC_R,
         _ => Vector3.zero,
     };
 
+    /// <summary>Bond line list for the pattern identified by the LEFT letter.</summary>
+    private List<BondLine> GetBondLines(char leftLetter) => leftLetter switch
+    {
+        'A' => bondLinesAT,
+        'T' => bondLinesTA,
+        'C' => bondLinesCG,
+        'G' => bondLinesGC,
+        _ => null,
+    };
+
+    /// <summary>Builds the initial strand of pairs. In automatic mode this is the classic
+    /// count * pairsPerStep layout. In manual mode it fills exactly the range between
+    /// Bottom Despawn Height and Top Spawn Height.</summary>
     private void SpawnBasePairs(float step)
     {
-        int total = TotalPairs;
-        int warnedMask = 0;
+        _haveTop = false;
 
-        for (int p = 0; p < total; p++)
+        bool manual = !useAutomaticBounds && topSpawnHeight > bottomDespawnHeight;
+
+        if (!manual)
         {
-            float t = p / pairsPerStep + pairHeightOffset;
+            int total = TotalPairs;
+            for (int p = 0; p < total; p++)
+                SpawnPair(p, GetPairLetter(p), step, false);
 
-            // Each pair gets its own random base, cached across respawns so changing
-            // unrelated settings does not reshuffle the sequence.
-            char leftLetter = GetPairLetter(p);
-            char rightLetter = Complement(leftLetter);
+            _nextSerial = total;
+            return;
+        }
 
-            GameObject leftPrefab = GetBasePrefab(leftLetter);
-            GameObject rightPrefab = GetBasePrefab(rightLetter);
+        // Serial range whose rest height lies inside [bottom, top]. Negative serials are fine:
+        // the letter lookup wraps, and the flip pattern uses (p & 1), which works for negatives.
+        int first = Mathf.CeilToInt(((bottomDespawnHeight - spawnPosition.y) / step - pairHeightOffset) * pairsPerStep);
+        int last = Mathf.FloorToInt(((topSpawnHeight - spawnPosition.y) / step - pairHeightOffset) * pairsPerStep);
+        last = Mathf.Min(last, first + MaxInitialPairs - 1); // safety cap
 
-            if (leftPrefab == null || rightPrefab == null)
+        for (int p = first; p <= last; p++)
+            SpawnPair(p, GetPairLetter(p), step, false);
+
+        _nextSerial = Mathf.Max(last + 1, first);
+    }
+
+    /// <summary>Spawns ONE complete base pair (pivot, both halves, elements, sugar, phosphate,
+    /// bond lines, sugar links and the backbone link to the previous top pair).
+    /// Used for both the initial strand and runtime respawning.
+    /// 'runtimeRespawn' = true when the pair is created at the top during the animation; in that
+    /// case, if Use Fixed Spawn Rotation is on, the pair appears with exactly Fixed Spawn Rotation
+    /// (or that rotation plus 180 degrees on alternating respawns when the alternate option is on).
+    /// Returns false if a prefab was missing and the pair was skipped.</summary>
+    private bool SpawnPair(int p, char leftLetter, float step, bool runtimeRespawn)
+    {
+        char rightLetter = Complement(leftLetter);
+
+        GameObject leftPrefab = GetBasePrefab(leftLetter);
+        GameObject rightPrefab = GetBasePrefab(rightLetter);
+
+        if (leftPrefab == null || rightPrefab == null)
+        {
+            char missing = leftPrefab == null ? leftLetter : rightLetter;
+            int bit = 1 << Bases.IndexOf(missing);
+            if ((_warnedMask & bit) == 0)
             {
-                char missing = leftPrefab == null ? leftLetter : rightLetter;
-                int bit = 1 << Bases.IndexOf(missing);
-                if ((warnedMask & bit) == 0)
-                {
-                    warnedMask |= bit;
-                    Debug.LogWarning($"DNASimulator: prefab for base '{missing}' is missing - those pairs are skipped.", this);
-                }
-                continue;
+                _warnedMask |= bit;
+                Debug.LogWarning($"DNASimulator: prefab for base '{missing}' is missing - those pairs are skipped.", this);
             }
+            return false;
+        }
 
-            Vector3 center = spawnPosition + Vector3.up * (t * step);
-            Quaternion pairPivotRot = GetPairPivotRotation(p, t);
+        float t = p / pairsPerStep + pairHeightOffset;
 
-            // Element distance is keyed off which letter is on the left, so each of the
-            // four patterns (A-T, T-A, C-G, G-C) can look different even when they share
-            // the same bases.
-            float elemDist = GetElementDistance(leftLetter);
+        Quaternion spinQ = Quaternion.AngleAxis(_spinAngle, Vector3.up);
 
-            // Base halves use the global left/right pair rotations.
-            Quaternion leftBaseRot = Quaternion.Euler(leftPairRotation);
-            Quaternion rightBaseRot = Quaternion.Euler(rightPairRotation);
+        // Rest pose (no fall, no spin) - the animation derives the live pose from this.
+        Vector3 restCenter = spawnPosition + Vector3.up * (t * step);
+        Quaternion restRot;
 
-            // Interior elements use the global element rotation plus the per-pattern override.
-            Quaternion leftElemRot = Quaternion.Euler(elementLocalRotation) *
-                                     Quaternion.Euler(GetElementRotationLeft(leftLetter));
-            Quaternion rightElemRot = Quaternion.Euler(elementLocalRotation) *
-                                      Quaternion.Euler(GetElementRotationRight(leftLetter));
+        if (runtimeRespawn && useFixedSpawnRotation)
+        {
+            // 1st spawn (even serial): Fixed Spawn Rotation rotated an extra 180 degrees around the strand's local Y.
+            // 2nd spawn (odd serial): exactly Fixed Spawn Rotation.
+            Quaternion targetRot = Quaternion.Euler(fixedSpawnRotation);
+            if (alternateFixedSpawnRotation180 && (p & 1) == 0)
+                targetRot = targetRot * Quaternion.Euler(0f, 180f, 0f);
 
-            // Sugar / phosphate alternate between the normal and "Flipped" position+rotation sets.
-            bool flipped = IsFlippedPair(p);
+            // The live rotation is spin * restRot. Pre-compensating the current spin makes the
+            // pair appear with EXACTLY targetRot right now; it then spins from there.
+            restRot = Quaternion.Inverse(spinQ) * targetRot;
+        }
+        else
+        {
+            restRot = GetPairPivotRotation(p, t);
+        }
 
-            // Game Mode: is one half of this pair planned to be missing? (-1 = left, +1 = right, 0 = none)
-            int missingSide = 0;
-            if (_gameModeActive) _missingSidePlan.TryGetValue(p, out missingSide);
+        // Live pose (identical to the rest pose during the initial spawn).
+        Vector3 livePos = restCenter + Vector3.down * _fallOffset;
+        Quaternion liveRot = spinQ * restRot;
 
-            // Game Mode parents pivots to their section root; normal mode uses the container as before.
-            Transform pivotParent = _gameModeActive ? GetSectionRootForPair(p) : _container;
+        float elemDist = GetElementDistance(leftLetter);
 
-            var pivotGo = new GameObject($"{PairPivotName}_{p}");
-            pivotGo.transform.SetParent(pivotParent, false);
-            pivotGo.transform.SetLocalPositionAndRotation(center, pairPivotRot);
-            MarkTemporary(pivotGo);
-            spawned.Add(pivotGo);
+        Quaternion leftBaseRot = Quaternion.Euler(leftPairRotation);
+        Quaternion rightBaseRot = Quaternion.Euler(rightPairRotation);
 
-            // A missing half skips ONLY its base (+ interior element). Its sugar / phosphate are still
-            // spawned so the backbone stays intact; the base is added later by the game.
-            GameObject leftGo = PlaceChild(leftPrefab, pivotGo.transform, Vector3.left * pairHalfLength, -1f, elemDist,
-                       leftBaseRot, leftElemRot, flipped,
-                       $"{leftPrefab.name}_Pair_{p}_L", leftLetter,
-                       spawnBase: missingSide >= 0, spawnBackbone: true);
+        Quaternion leftElemRot = Quaternion.Euler(elementLocalRotation) *
+                                 Quaternion.Euler(GetElementRotationLeft(leftLetter));
+        Quaternion rightElemRot = Quaternion.Euler(elementLocalRotation) *
+                                  Quaternion.Euler(GetElementRotationRight(leftLetter));
 
-            GameObject rightGo = PlaceChild(rightPrefab, pivotGo.transform, Vector3.right * pairHalfLength, 1f, elemDist,
-                       rightBaseRot, rightElemRot, flipped,
-                       $"{rightPrefab.name}_Pair_{p}_R", rightLetter,
-                       spawnBase: missingSide <= 0, spawnBackbone: true);
+        bool flipped = IsFlippedPair(p);
 
-            // Remember the slot so the game can fill it with the exact same placement values.
-            if (missingSide != 0)
-            {
-                bool leftIsMissing = missingSide < 0;
-                _slots[p] = new MissingSlot
-                {
-                    pairIndex = p,
-                    sectionIndex = GetSectionIndexForPair(p),
-                    isLeft = leftIsMissing,
-                    correctLetter = leftIsMissing ? leftLetter : rightLetter,
-                    visibleLetter = leftIsMissing ? rightLetter : leftLetter,
-                    parent = pivotGo.transform,
-                    localPos = Vector3.right * (leftIsMissing ? -pairHalfLength : pairHalfLength),
-                    side = leftIsMissing ? -1f : 1f,
-                    elemDist = elemDist,
-                    baseRot = leftIsMissing ? leftBaseRot : rightBaseRot,
-                    elemRot = leftIsMissing ? leftElemRot : rightElemRot,
-                    flipped = flipped,
-                    visibleGo = leftIsMissing ? rightGo : leftGo,
-                    currentGo = null,
-                };
-            }
+        var pivotGo = new GameObject($"{PairPivotName}_{p}");
+        pivotGo.transform.SetParent(_container, false);
+        pivotGo.transform.SetLocalPositionAndRotation(livePos, liveRot);
+        MarkTemporary(pivotGo);
+        spawned.Add(pivotGo);
+
+        HalfRuntimeInfo infoL = PlaceChild(leftPrefab, pivotGo.transform, Vector3.left * pairHalfLength, -1f, elemDist,
+                                           leftBaseRot, leftElemRot, flipped,
+                                           $"{leftPrefab.name}_Pair_{p}_L", leftLetter);
+
+        HalfRuntimeInfo infoR = PlaceChild(rightPrefab, pivotGo.transform, Vector3.right * pairHalfLength, 1f, elemDist,
+                                           rightBaseRot, rightElemRot, flipped,
+                                           $"{rightPrefab.name}_Pair_{p}_R", rightLetter);
+
+        infoL.restPos = restCenter; infoL.restRot = restRot;
+        infoR.restPos = restCenter; infoR.restRot = restRot;
+
+        // Bond lines belong to the pair pivot, so they twist / move with the DNA.
+        if (spawnBondLines)
+            SpawnBondLinesForPair(pivotGo.transform, leftLetter, rightLetter, p);
+
+        // Phosphate (previous pair) -> Sugar (this pair), per side, forming the backbone chain.
+        if (_haveTop && phosphateToNextSugarLine != null && phosphateToNextSugarLine.enabled)
+        {
+            if (_topL.hasPhos && infoL.hasSugar)
+                CreateCrossPairLine(_topL, infoL, phosphateToNextSugarLine, "L");
+
+            if (_topR.hasPhos && infoR.hasSugar)
+                CreateCrossPairLine(_topR, infoR, phosphateToNextSugarLine, "R");
+        }
+
+        _topL = infoL;
+        _topR = infoR;
+        _haveTop = true;
+
+        _pairs.Add(new PairRuntime
+        {
+            serial = p,
+            pivot = pivotGo.transform,
+            restPos = restCenter,
+            restRot = restRot,
+            leftLetter = leftLetter,
+            rightLetter = rightLetter,
+        });
+
+        return true;
+    }
+
+    /// <summary>Creates one LineRenderer object per entry in the list for this pair's pattern.
+    /// Coordinates are pair-pivot local (useWorldSpace = false, identity local transform).</summary>
+    private void SpawnBondLinesForPair(Transform pivot, char leftLetter, char rightLetter, int pairIndex)
+    {
+        List<BondLine> lines = GetBondLines(leftLetter);
+        if (lines == null || lines.Count == 0) return;
+
+        Material mat = GetBondMaterial();
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            BondLine bl = lines[i];
+            if (bl == null) continue;
+
+            CreateLine(pivot, $"__Bond_{leftLetter}{rightLetter}_Pair_{pairIndex}_{i}",
+                       bl.startA, bl.endB, bl.dashed, bondLineColor, bondLineWidth, mat);
         }
     }
 
-    private GameObject Place(GameObject source, Vector3 localPos, Quaternion localRot, string objName, Transform parent = null)
+    /// <summary>Creates a line from the phosphate of one pair to the sugar of the next pair on the
+    /// same side. The FROM info must carry a phosphate; the TO info must carry a sugar.
+    ///
+    /// The line is parented to the FROM pair's pivot and its endpoints are expressed in that pivot's
+    /// local space, computed from the two pivots' REST poses. Because every pair shares the same
+    /// fall + spin (spin is about the Y axis the pivots sit on), the relative pose between two pairs
+    /// never changes, so the line follows the animation automatically and is destroyed together
+    /// with its pair.</summary>
+    private void CreateCrossPairLine(HalfRuntimeInfo fromInfo, HalfRuntimeInfo toInfo,
+                                     LinkLine line, string sideLabel)
     {
-        GameObject go = Instantiate(source, parent != null ? parent : _container);
+        // Offsets are authored in each piece's own local space.
+        Vector3 fromOffset = line.GetFrom(fromInfo.isLeft, fromInfo.flipped);
+        Vector3 toOffset = line.GetTo(toInfo.isLeft, toInfo.flipped);
+
+        // Endpoint A in the FROM pivot's local space (scale, then rotate, then translate).
+        Vector3 a = fromInfo.phosPos + fromInfo.phosRot *
+                    Vector3.Scale(phosphateLocalScale, fromOffset);
+
+        // Endpoint B in the TO pivot's local space -> container rest space -> FROM pivot's local space.
+        Vector3 bInToPivot = toInfo.sugarPos + toInfo.sugarRot *
+                             Vector3.Scale(sugarLocalScale, toOffset);
+        Vector3 bRest = toInfo.restPos + toInfo.restRot * bInToPivot;
+        Vector3 b = Quaternion.Inverse(fromInfo.restRot) * (bRest - fromInfo.restPos);
+
+        CreateLine(fromInfo.pivot, $"__PhosToNextSugar_{sideLabel}_{fromInfo.pivot.name}", a, b,
+                   line.dashed, line.color, line.width, GetBondMaterial());
+    }
+
+    /// <summary>Creates a solid line (one LineRenderer) or a dashed line (a holder object with one
+    /// short LineRenderer per dash). a / b are in the parent's local space.</summary>
+    private void CreateLine(Transform parent, string objName, Vector3 a, Vector3 b,
+                            bool dashed, Color color, float width, Material mat)
+    {
+        var holder = new GameObject(objName);
+        holder.transform.SetParent(parent, false);
+        holder.transform.SetLocalPositionAndRotation(Vector3.zero, Quaternion.identity);
+        holder.transform.localScale = Vector3.one;
+        MarkTemporary(holder);
+        spawned.Add(holder);
+
+        if (!dashed)
+        {
+            ConfigureLine(holder.AddComponent<LineRenderer>(), a, b, color, width, mat);
+            return;
+        }
+
+        Vector3 delta = b - a;
+        float len = delta.magnitude;
+        if (len < 1e-5f) return;
+
+        Vector3 dir = delta / len;
+        float dash = Mathf.Max(0.001f, dashLength);
+        float period = dash + Mathf.Max(0f, dashGap);
+        int n = 0;
+
+        for (float s0 = 0f; s0 < len && n < maxDashesPerLine; s0 += period, n++)
+        {
+            float e0 = Mathf.Min(s0 + dash, len);
+
+            var d = new GameObject($"Dash_{n}");
+            d.transform.SetParent(holder.transform, false);
+            d.transform.SetLocalPositionAndRotation(Vector3.zero, Quaternion.identity);
+            d.transform.localScale = Vector3.one;
+            MarkTemporary(d);
+            spawned.Add(d);
+
+            ConfigureLine(d.AddComponent<LineRenderer>(), a + dir * s0, a + dir * e0, color, width, mat);
+        }
+    }
+
+    private void ConfigureLine(LineRenderer lr, Vector3 a, Vector3 b, Color color, float width, Material mat)
+    {
+        lr.useWorldSpace = false;
+        lr.positionCount = 2;
+        lr.SetPosition(0, a);
+        lr.SetPosition(1, b);
+        lr.startWidth = width;
+        lr.endWidth = width;
+        lr.startColor = color;
+        lr.endColor = color;
+        lr.alignment = bondLineAlignment;
+        lr.numCapVertices = bondLineCapVertices;
+        lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        lr.receiveShadows = false;
+        lr.sharedMaterial = mat;
+    }
+
+    private Material GetBondMaterial()
+    {
+        if (bondLineMaterial != null) return bondLineMaterial;
+
+        if (_fallbackBondMaterial == null)
+        {
+            Shader sh = Shader.Find("Sprites/Default");
+            if (sh == null)
+            {
+                Debug.LogWarning("DNASimulator: no bond line material assigned and Sprites/Default was not found.", this);
+                return null;
+            }
+            _fallbackBondMaterial = new Material(sh) { name = "DNA_BondLine_Fallback", hideFlags = HideFlags.DontSave };
+        }
+        return _fallbackBondMaterial;
+    }
+
+    private void Place(GameObject source, Vector3 localPos, Quaternion localRot, string objName)
+    {
+        GameObject go = Instantiate(source, _container);
         go.name = objName;
         go.transform.SetLocalPositionAndRotation(localPos, localRot);
         MarkTemporary(go);
         spawned.Add(go);
-        return go;
     }
 
     /// <summary>Spawns a base half and, if enabled, its matching interior element as a child of
@@ -743,65 +1141,61 @@ public class DNASimulator2 : MonoBehaviour
     /// Their offset is still authored relative to the base half (position / rotation are
     /// composed with the base half's local transform).
     ///
-    /// Game Mode additions: spawnBase = false skips the base half (+ its element), and
-    /// spawnBackbone = false skips sugar / phosphate. This lets the game spawn a missing base later
-    /// with exactly the same placement math, without duplicating the sugar / phosphate.
-    /// Returns the spawned base half (null if the base was not spawned).</summary>
-    private GameObject PlaceChild(GameObject source, Transform parent, Vector3 localPos, float side,
+    /// Returns the poses of the spawned sugar / phosphate so cross-pair link lines can be built.</summary>
+    private HalfRuntimeInfo PlaceChild(GameObject source, Transform parent, Vector3 localPos, float side,
                             float elementDist, Quaternion baseLocalRot, Quaternion elementLocalRot,
                             bool flipped,
-                            string objName, char letter,
-                            bool spawnBase = true, bool spawnBackbone = true)
+                            string objName, char letter)
     {
-        GameObject go = null;
+        GameObject go = Instantiate(source, parent);
+        go.name = objName;
+        go.transform.localPosition = localPos;
+        go.transform.localRotation = baseLocalRot;
+        go.transform.localScale = source.transform.localScale;
+        MarkTemporary(go);
+        spawned.Add(go);
 
-        if (spawnBase && source != null)
+        // Measure the base half's own mesh bounds (in its local space) BEFORE the interior element
+        // is added as a child, so the sugar -> base line snaps to the base block only.
+        bool haveBaseBounds = TryGetLocalMeshBounds(go.transform, out Bounds baseBounds);
+
+        // --- Interior element (child of the base half, inherits its scale) ---
+        if (spawnElements)
         {
-            go = Instantiate(source, parent);
-            go.name = objName;
-            go.transform.localPosition = localPos;
-            go.transform.localRotation = baseLocalRot;
-            go.transform.localScale = source.transform.localScale;
-            MarkTemporary(go);
-            spawned.Add(go);
-
-            // --- Interior element (child of the base half, inherits its scale) ---
-            if (spawnElements)
+            GameObject elementPrefab = GetElementPrefab(letter);
+            if (elementPrefab != null)
             {
-                GameObject elementPrefab = GetElementPrefab(letter);
-                if (elementPrefab != null)
-                {
-                    GameObject element = Instantiate(elementPrefab, go.transform);
-                    element.name = $"{elementPrefab.name}_Element_{letter}";
+                GameObject element = Instantiate(elementPrefab, go.transform);
+                element.name = $"{elementPrefab.name}_Element_{letter}";
 
-                    // Target the element's PIVOT-space position: ±Element Distance along the pivot's X axis.
-                    Vector3 desiredInPivotSpace = Vector3.right * (side * elementDist);
+                // Target the element's PIVOT-space position: +/-Element Distance along the pivot's X axis.
+                Vector3 desiredInPivotSpace = Vector3.right * (side * elementDist);
 
-                    // The base half sits at localPos (pivot space) with rotation baseLocalRot and scale goScale.
-                    // elementWorldInPivot = localPos + baseLocalRot * (goScale .* elementLocalPos)
-                    // Solve for elementLocalPos so the result equals desiredInPivotSpace.
-                    Vector3 deltaInPivotSpace = desiredInPivotSpace - localPos;
-                    Vector3 deltaInGoLocalSpace = Quaternion.Inverse(baseLocalRot) * deltaInPivotSpace;
+                // elementWorldInPivot = localPos + baseLocalRot * (goScale .* elementLocalPos)
+                // Solve for elementLocalPos so the result equals desiredInPivotSpace.
+                Vector3 deltaInPivotSpace = desiredInPivotSpace - localPos;
+                Vector3 deltaInGoLocalSpace = Quaternion.Inverse(baseLocalRot) * deltaInPivotSpace;
 
-                    // Compensate for the base half's local scale so the element lands where we asked
-                    // even when the base prefab is stretched (non-uniform scale).
-                    Vector3 goScale = go.transform.localScale;
-                    if (goScale.x != 0f) deltaInGoLocalSpace.x /= goScale.x;
-                    if (goScale.y != 0f) deltaInGoLocalSpace.y /= goScale.y;
-                    if (goScale.z != 0f) deltaInGoLocalSpace.z /= goScale.z;
+                // Compensate for the base half's local scale (non-uniform scale safe).
+                Vector3 goScale = go.transform.localScale;
+                if (goScale.x != 0f) deltaInGoLocalSpace.x /= goScale.x;
+                if (goScale.y != 0f) deltaInGoLocalSpace.y /= goScale.y;
+                if (goScale.z != 0f) deltaInGoLocalSpace.z /= goScale.z;
 
-                    element.transform.localPosition = deltaInGoLocalSpace + elementLocalPosition;
-                    element.transform.localRotation = elementLocalRot;
-                    element.transform.localScale = elementLocalScale;
-                    MarkTemporary(element);
-                    spawned.Add(element);
-                }
+                element.transform.localPosition = deltaInGoLocalSpace + elementLocalPosition;
+                element.transform.localRotation = elementLocalRot;
+                element.transform.localScale = elementLocalScale;
+                MarkTemporary(element);
+                spawned.Add(element);
             }
         }
 
-        if (!spawnBackbone) return go;
-
         bool isLeft = side < 0f;
+
+        // Poses (pair-pivot space) captured for the sugar link lines.
+        bool haveSugar = false, havePhos = false;
+        Vector3 sugarPos = Vector3.zero, phosPos = Vector3.zero;
+        Quaternion sugarRot = Quaternion.identity, phosRot = Quaternion.identity;
 
         // --- Sugar (sibling of the base half, parented to the pivot - scale independent) ---
         if (spawnSugar && prefabSugar != null)
@@ -809,7 +1203,6 @@ public class DNASimulator2 : MonoBehaviour
             GameObject sugar = Instantiate(prefabSugar, parent);
             sugar.name = $"{prefabSugar.name}_Sugar_{(isLeft ? "L" : "R")}_{letter}";
 
-            // Pick normal vs flipped authored offset / rotation.
             Vector3 sugarOffset = flipped
                 ? (isLeft ? sugarLocalPositionLeftFlipped : sugarLocalPositionRightFlipped)
                 : (isLeft ? sugarLocalPositionLeft : sugarLocalPositionRight);
@@ -823,6 +1216,9 @@ public class DNASimulator2 : MonoBehaviour
             sugar.transform.localPosition = localPos + baseLocalRot * sugarOffset;
             sugar.transform.localRotation = baseLocalRot * sugarRotOffset;
             sugar.transform.localScale = sugarLocalScale;
+            sugarPos = sugar.transform.localPosition;
+            sugarRot = sugar.transform.localRotation;
+            haveSugar = true;
 
             MarkTemporary(sugar);
             spawned.Add(sugar);
@@ -844,31 +1240,102 @@ public class DNASimulator2 : MonoBehaviour
 
             Quaternion phosRotOffset = Quaternion.Euler(phosRotEuler);
 
-            phosphate.transform.localPosition = localPos + baseLocalRot * phosOffset;
-            phosphate.transform.localRotation = baseLocalRot * phosRotOffset;
+            Vector3 phosPose = localPos + baseLocalRot * phosOffset;
+            Quaternion phosRotPose = baseLocalRot * phosRotOffset;
+
+            // Phosphate rides along with its sugar: apply the sugar's flip (normal pose -> flipped pose)
+            // as a rigid transform to the phosphate's NORMAL pose.
+            if (flipped && phosphateFollowsSugarFlip && haveSugar)
+            {
+                Vector3 sugarNormalPos = localPos + baseLocalRot *
+                    (isLeft ? sugarLocalPositionLeft : sugarLocalPositionRight);
+                Quaternion sugarNormalRot = baseLocalRot * Quaternion.Euler(
+                    isLeft ? sugarLocalRotationLeft : sugarLocalRotationRight);
+                Vector3 phosNormalPos = localPos + baseLocalRot *
+                    (isLeft ? phosphateLocalPositionLeft : phosphateLocalPositionRight);
+                Quaternion phosNormalRot = baseLocalRot * Quaternion.Euler(
+                    isLeft ? phosphateLocalRotationLeft : phosphateLocalRotationRight);
+
+                // sugarPos / sugarRot are the sugar's FLIPPED pose (captured above).
+                Quaternion flipDelta = sugarRot * Quaternion.Inverse(sugarNormalRot);
+                phosPose = sugarPos + flipDelta * (phosNormalPos - sugarNormalPos);
+                phosRotPose = flipDelta * phosNormalRot;
+            }
+
+            phosphate.transform.localPosition = phosPose;
+            phosphate.transform.localRotation = phosRotPose;
             phosphate.transform.localScale = phosphateLocalScale;
+            phosPos = phosphate.transform.localPosition;
+            phosRot = phosphate.transform.localRotation;
+            havePhos = true;
 
             MarkTemporary(phosphate);
             spawned.Add(phosphate);
         }
 
-        return go;
+        // --- Sugar link lines (children of the pair pivot, so they twist with the DNA) ---
+        if (haveSugar)
+        {
+            Material mat = GetBondMaterial();
+            Vector3 baseScale = go.transform.localScale;
+
+            if (sugarToBaseLine != null && sugarToBaseLine.enabled)
+            {
+                LinkLine l = sugarToBaseLine;
+                Vector3 a = sugarPos + sugarRot * Vector3.Scale(sugarLocalScale, l.GetFrom(isLeft, flipped));
+                Vector3 toOffset = l.GetTo(isLeft, flipped);
+                Vector3 b;
+
+                if (l.snapToTargetSurface && haveBaseBounds)
+                {
+                    // Sugar end point -> base half's local (unscaled) space.
+                    Vector3 aInBase = Quaternion.Inverse(baseLocalRot) * (a - localPos);
+                    aInBase = DivideSafe(aInBase, baseScale);
+
+                    Vector3 surface = ClosestPointOnBoundsSurface(baseBounds, aInBase);
+                    b = localPos + baseLocalRot * Vector3.Scale(baseScale, surface + toOffset);
+                }
+                else
+                {
+                    b = localPos + baseLocalRot * Vector3.Scale(baseScale, toOffset);
+                }
+
+                CreateLine(parent, $"__SugarToBase_{(isLeft ? "L" : "R")}_{letter}", a, b,
+                           l.dashed, l.color, l.width, mat);
+            }
+
+            if (havePhos && sugarToPhosphateLine != null && sugarToPhosphateLine.enabled)
+            {
+                LinkLine l = sugarToPhosphateLine;
+                Vector3 a = sugarPos + sugarRot * Vector3.Scale(sugarLocalScale, l.GetFrom(isLeft, flipped));
+                Vector3 b = phosPos + phosRot * Vector3.Scale(phosphateLocalScale, l.GetTo(isLeft, flipped));
+                CreateLine(parent, $"__SugarToPhosphate_{(isLeft ? "L" : "R")}_{letter}", a, b,
+                           l.dashed, l.color, l.width, mat);
+            }
+        }
+
+        return new HalfRuntimeInfo
+        {
+            hasSugar = haveSugar,
+            hasPhos = havePhos,
+            flipped = flipped,
+            isLeft = isLeft,
+            pivot = parent,
+            sugarPos = sugarPos,
+            sugarRot = sugarRot,
+            phosPos = phosPos,
+            phosRot = phosRot,
+        };
     }
 
     [ContextMenu("Clear Spawned")]
     public void ClearSpawned()
     {
-        // Destroying the DNA invalidates a running game, so cancel it - unless GameMode() itself
-        // is respawning the DNA as part of starting the game.
-        if (!_buildingGame) CancelGameInternal();
-        else
-        {
-            // Keep the plan, but the old section roots are about to be destroyed.
-            for (int i = 0; i < _sections.Count; i++) _sections[i].root = null;
-            _slots.Clear();
-        }
-
         spawned.Clear();
+        _pairs.Clear();
+        _removeSet.Clear();
+        _haveTop = false;
+        _animReady = false;
         _container = null;
 
         for (int i = transform.childCount - 1; i >= 0; i--)
@@ -917,6 +1384,71 @@ public class DNASimulator2 : MonoBehaviour
         'C' => elementC,
         _ => elementG,
     };
+
+    // =================================================================== Surface snapping
+    /// <summary>Bounds of all meshes under 'root', expressed in root's LOCAL (unscaled-by-root) space.</summary>
+    private static bool TryGetLocalMeshBounds(Transform root, out Bounds bounds)
+    {
+        bounds = new Bounds();
+        bool found = false;
+        Matrix4x4 worldToRoot = root.worldToLocalMatrix;
+
+        foreach (MeshFilter mf in root.GetComponentsInChildren<MeshFilter>())
+        {
+            Mesh mesh = mf.sharedMesh;
+            if (mesh == null) continue;
+
+            Matrix4x4 m = worldToRoot * mf.transform.localToWorldMatrix;
+            Vector3 c = mesh.bounds.center;
+            Vector3 e = mesh.bounds.extents;
+
+            for (int corner = 0; corner < 8; corner++)
+            {
+                Vector3 v = m.MultiplyPoint3x4(c + new Vector3(
+                    (corner & 1) == 0 ? -e.x : e.x,
+                    (corner & 2) == 0 ? -e.y : e.y,
+                    (corner & 4) == 0 ? -e.z : e.z));
+
+                if (!found) { bounds = new Bounds(v, Vector3.zero); found = true; }
+                else bounds.Encapsulate(v);
+            }
+        }
+        return found;
+    }
+
+    /// <summary>Closest point on the SURFACE of the box to p. If p is inside the box it is pushed
+    /// out to the nearest face, so the line never ends inside the block.</summary>
+    private static Vector3 ClosestPointOnBoundsSurface(Bounds b, Vector3 p)
+    {
+        Vector3 min = b.min, max = b.max;
+        Vector3 c = new Vector3(
+            Mathf.Clamp(p.x, min.x, max.x),
+            Mathf.Clamp(p.y, min.y, max.y),
+            Mathf.Clamp(p.z, min.z, max.z));
+
+        if (c != p) return c; // p was outside: the clamped point is on the surface
+
+        // p is inside: move to the nearest face.
+        float dxMin = p.x - min.x, dxMax = max.x - p.x;
+        float dyMin = p.y - min.y, dyMax = max.y - p.y;
+        float dzMin = p.z - min.z, dzMax = max.z - p.z;
+
+        float best = dxMin; c = new Vector3(min.x, p.y, p.z);
+        if (dxMax < best) { best = dxMax; c = new Vector3(max.x, p.y, p.z); }
+        if (dyMin < best) { best = dyMin; c = new Vector3(p.x, min.y, p.z); }
+        if (dyMax < best) { best = dyMax; c = new Vector3(p.x, max.y, p.z); }
+        if (dzMin < best) { best = dzMin; c = new Vector3(p.x, p.y, min.z); }
+        if (dzMax < best) { c = new Vector3(p.x, p.y, max.z); }
+        return c;
+    }
+
+    private static Vector3 DivideSafe(Vector3 v, Vector3 s)
+    {
+        return new Vector3(
+            s.x != 0f ? v.x / s.x : v.x,
+            s.y != 0f ? v.y / s.y : v.y,
+            s.z != 0f ? v.z / s.z : v.z);
+    }
 
     // =================================================================== Height measuring
     private float GetStepHeight()
@@ -969,6 +1501,9 @@ public class DNASimulator2 : MonoBehaviour
     }
 
     // =================================================================== Change detection
+    // NOTE: speeds and on/off toggles of the DNA Animation are intentionally NOT part of this hash.
+    // The fixed spawn rotation only affects runtime respawns, so it is not part of the hash either.
+    // The bounds ARE included, because in manual mode they decide which pairs the initial strand contains.
     private int ComputeSettingsHash()
     {
         int h = 17;
@@ -984,7 +1519,7 @@ public class DNASimulator2 : MonoBehaviour
         h = Mix(h, phosphateLocalPositionLeft); h = Mix(h, phosphateLocalPositionRight);
         h = Mix(h, phosphateLocalRotationLeft); h = Mix(h, phosphateLocalRotationRight);
         h = Mix(h, phosphateLocalScale);
-        h = Mix(h, alternateSugarPhosphateFlip);
+        h = Mix(h, alternateSugarPhosphateFlip); h = Mix(h, phosphateFollowsSugarFlip);
         h = Mix(h, sugarLocalPositionLeftFlipped); h = Mix(h, sugarLocalPositionRightFlipped);
         h = Mix(h, sugarLocalRotationLeftFlipped); h = Mix(h, sugarLocalRotationRightFlipped);
         h = Mix(h, phosphateLocalPositionLeftFlipped); h = Mix(h, phosphateLocalPositionRightFlipped);
@@ -1000,8 +1535,22 @@ public class DNASimulator2 : MonoBehaviour
         h = Mix(h, elementRotationGC_L); h = Mix(h, elementRotationGC_R);
         h = Mix(h, elementDistanceAT); h = Mix(h, elementDistanceTA);
         h = Mix(h, elementDistanceCG); h = Mix(h, elementDistanceGC);
+
+        // Bond lines
+        h = Mix(h, spawnBondLines); h = Mix(h, bondLineMaterial);
+        h = Mix(h, bondLineColor); h = Mix(h, bondLineWidth);
+        h = Mix(h, (int)bondLineAlignment); h = Mix(h, bondLineCapVertices);
+        h = Mix(h, bondLinesAT); h = Mix(h, bondLinesTA);
+        h = Mix(h, bondLinesCG); h = Mix(h, bondLinesGC);
+        h = Mix(h, dashLength); h = Mix(h, dashGap); h = Mix(h, maxDashesPerLine);
+        h = Mix(h, sugarToBaseLine); h = Mix(h, sugarToPhosphateLine);
+        h = Mix(h, phosphateToNextSugarLine);
+
         h = Mix(h, spawnPosition); h = Mix(h, baseRotation);
         h = Mix(h, count); h = Mix(h, rotationOffsetPerStep); h = Mix(h, stackGap); h = Mix(h, stepHeightOverride);
+
+        // Animation bounds (they define the initial pair range in manual mode)
+        h = Mix(h, useAutomaticBounds); h = Mix(h, topSpawnHeight); h = Mix(h, bottomDespawnHeight);
         return h;
     }
 
@@ -1009,656 +1558,34 @@ public class DNASimulator2 : MonoBehaviour
     private static int Mix(int h, float v) => Mix(h, v.GetHashCode());
     private static int Mix(int h, bool v) => Mix(h, v ? 1 : 0);
     private static int Mix(int h, Vector3 v) => Mix(h, v.GetHashCode());
+    private static int Mix(int h, Color c) => Mix(h, c.GetHashCode());
     private static int Mix(int h, string s) => Mix(h, s != null ? s.GetHashCode() : 0);
     private static int Mix(int h, Object o) => Mix(h, o != null ? o.GetInstanceID() : 0);
-
-    // =================================================================== GAME MODE
-    // ---------------------------------------------------------------------------------
-    // Flow:
-    //   GameMode()  -> BuildGamePlan() (sections + which pairs/sides are missing)
-    //               -> Spawn() (normal generator; missing halves skip their base, sections get roots)
-    //               -> BuildTargets() (ordered list of missing slots)
-    //               -> GameStartRoutine(): camera moves in, first target is selected
-    //   SubmitBaseAnswer(letter) -> AnswerRoutine(): flash, fill the slot, move the section, next target
-    // ---------------------------------------------------------------------------------
-
-    /// <summary>Starts the DNA base-pairing mini-game. Call from the Context Menu (Play Mode) or from code.</summary>
-    [ContextMenu("Game Mode")]
-    public void GameMode()
+    private static int Mix(int h, LinkLine l)
     {
-        if (!enableGameMode)
-        {
-            Debug.LogWarning("DNASimulator: Game Mode is disabled (Enable Game Mode is off).", this);
-            return;
-        }
-        if (!Application.isPlaying)
-        {
-            Debug.LogWarning("DNASimulator: Game Mode needs Play Mode (camera / flash animations use coroutines).", this);
-            return;
-        }
-        if (prefab == null)
-        {
-            Debug.LogWarning("DNASimulator: no strand prefab assigned - cannot start Game Mode.", this);
-            return;
-        }
-        if (!spawnBasePairs)
-        {
-            Debug.LogWarning("DNASimulator: 'Spawn Base Pairs' must be enabled for Game Mode.", this);
-            return;
-        }
-
-        // Stop any previous game and restore its temporary colors.
-        CancelGameInternal();
-        ConnectButtons();
-
-        // Build the plan first, then respawn the DNA with the plan applied.
-        // The cached base sequence is kept, so the DNA looks the same as before (unless settings changed).
-        _buildingGame = true;
-        _gameModeActive = true;
-        try
-        {
-            BuildGamePlan();
-            Spawn();
-        }
-        finally
-        {
-            _buildingGame = false;
-        }
-
-        BuildTargets();
-
-        if (buttonsPanel != null) buttonsPanel.SetActive(true);
-        OnGameStarted?.Invoke();
-
-        StartCoroutine(GameStartRoutine());
+        if (l == null) return Mix(h, -1);
+        h = Mix(h, l.enabled); h = Mix(h, l.dashed); h = Mix(h, l.color); h = Mix(h, l.width);
+        h = Mix(h, l.snapToTargetSurface);
+        h = Mix(h, l.fromOffsetLeft); h = Mix(h, l.toOffsetLeft);
+        h = Mix(h, l.fromOffsetRight); h = Mix(h, l.toOffsetRight);
+        h = Mix(h, l.useFlippedOffsets);
+        h = Mix(h, l.fromOffsetLeftFlipped); h = Mix(h, l.toOffsetLeftFlipped);
+        h = Mix(h, l.fromOffsetRightFlipped); h = Mix(h, l.toOffsetRightFlipped);
+        return h;
     }
-
-    /// <summary>Leaves Game Mode: stops the game, restores the camera and respawns the normal DNA.</summary>
-    [ContextMenu("Exit Game Mode")]
-    public void ExitGameMode()
+    private static int Mix(int h, List<BondLine> list)
     {
-        CancelGameInternal();
-        RestoreCamera();
-        if (buttonsPanel != null) buttonsPanel.SetActive(false);
-        if (Application.isPlaying) Spawn();
-    }
-
-    /// <summary>Called by the C / A / T / G buttons (or by your own script).
-    /// Ignored unless the game is waiting for an answer.</summary>
-    public void SubmitBaseAnswer(char letter)
-    {
-        if (!_gameModeActive || _state != GameState.Playing || _currentTarget == null) return;
-
-        letter = char.ToUpperInvariant(letter);
-        if (Bases.IndexOf(letter) < 0) return;
-
-        // Lock input immediately so a second click during the flash is ignored.
-        _state = letter == _currentTarget.correctLetter ? GameState.FlashingCorrect : GameState.FlashingWrong;
-        StartCoroutine(AnswerRoutine(letter));
-    }
-
-    // ------------------------------------------------------------------ Buttons
-    /// <summary>Hooks the four UI buttons to SubmitBaseAnswer. Safe to call repeatedly
-    /// (e.g. after assigning buttons from code).</summary>
-    public void ConnectButtons()
-    {
-        DisconnectButtons();
-        if (!autoConnectButtons) return;
-
-        _clickC ??= () => SubmitBaseAnswer('C');
-        _clickA ??= () => SubmitBaseAnswer('A');
-        _clickT ??= () => SubmitBaseAnswer('T');
-        _clickG ??= () => SubmitBaseAnswer('G');
-
-        if (buttonC != null) buttonC.onClick.AddListener(_clickC);
-        if (buttonA != null) buttonA.onClick.AddListener(_clickA);
-        if (buttonT != null) buttonT.onClick.AddListener(_clickT);
-        if (buttonG != null) buttonG.onClick.AddListener(_clickG);
-    }
-
-    private void DisconnectButtons()
-    {
-        if (_clickC != null && buttonC != null) buttonC.onClick.RemoveListener(_clickC);
-        if (_clickA != null && buttonA != null) buttonA.onClick.RemoveListener(_clickA);
-        if (_clickT != null && buttonT != null) buttonT.onClick.RemoveListener(_clickT);
-        if (_clickG != null && buttonG != null) buttonG.onClick.RemoveListener(_clickG);
-    }
-
-    private Button GetButton(char letter) => letter switch
-    {
-        'C' => buttonC,
-        'A' => buttonA,
-        'T' => buttonT,
-        'G' => buttonG,
-        _ => null,
-    };
-
-    /// <summary>Briefly tints a UI button's graphic, then restores its exact original color.</summary>
-    private void FlashButton(Button button, Color color, float duration)
-    {
-        if (!flashButtons || button == null || button.targetGraphic == null) return;
-        StartCoroutine(FlashButtonRoutine(button.targetGraphic, color, duration));
-    }
-
-    private IEnumerator FlashButtonRoutine(Graphic graphic, Color color, float duration)
-    {
-        if (!_buttonOriginals.ContainsKey(graphic)) _buttonOriginals[graphic] = graphic.color;
-        graphic.color = color;
-
-        yield return new WaitForSeconds(duration);
-
-        if (graphic != null && _buttonOriginals.TryGetValue(graphic, out Color original))
+        if (list == null) return Mix(h, -1);
+        h = Mix(h, list.Count);
+        for (int i = 0; i < list.Count; i++)
         {
-            graphic.color = original;
-            _buttonOriginals.Remove(graphic);
+            BondLine bl = list[i];
+            if (bl == null) { h = Mix(h, 0); continue; }
+            h = Mix(h, bl.startA);
+            h = Mix(h, bl.endB);
+            h = Mix(h, bl.dashed);
         }
-    }
-
-    private void RestoreAllButtonColors()
-    {
-        foreach (var kv in _buttonOriginals)
-            if (kv.Key != null) kv.Key.color = kv.Value;
-        _buttonOriginals.Clear();
-    }
-
-    // ------------------------------------------------------------------ Plan: sections + missing bases
-    /// <summary>Resolves the section ranges and randomly chooses which pair / side is missing in each section.</summary>
-    private void BuildGamePlan()
-    {
-        _missingSidePlan.Clear();
-        _slots.Clear();
-        ResolveSections();
-
-        var rng = new System.Random(gameSeed != 0 ? gameSeed : System.Environment.TickCount);
-
-        for (int s = 0; s < _sections.Count; s++)
-        {
-            SectionRuntime sec = _sections[s];
-            int len = sec.end - sec.start + 1;
-            if (len <= 0) continue;
-
-            int missing = Mathf.Clamp(sec.missing, 0, len);
-
-            // Partial Fisher-Yates: pick 'missing' distinct pair indices.
-            var pool = new List<int>(len);
-            for (int p = sec.start; p <= sec.end; p++) pool.Add(p);
-
-            for (int k = 0; k < missing; k++)
-            {
-                int r = rng.Next(k, pool.Count);
-                (pool[k], pool[r]) = (pool[r], pool[k]);
-
-                int side = rng.Next(2) == 0 ? -1 : 1; // -1 = LEFT half missing, +1 = RIGHT half missing
-                _missingSidePlan[pool[k]] = side;
-            }
-        }
-    }
-
-    /// <summary>Turns the serialized GameSection list into concrete pair ranges.</summary>
-    private void ResolveSections()
-    {
-        _sections.Clear();
-
-        if (gameSections == null || gameSections.Count == 0)
-        {
-            Debug.LogWarning("DNASimulator: no Game Sections configured - Game Mode has nothing to play.", this);
-            return;
-        }
-
-        int total = TotalPairs;
-        int n = gameSections.Count;
-        int[] starts = new int[n];
-        int[] ends = new int[n];
-
-        if (autoDivideSections)
-        {
-            // Split the pairs evenly. Pair 0 is the BOTTOM pair, so with section1AtTop the LAST section
-            // gets the lowest pair indices.
-            int baseSize = total / n;
-            int rem = total % n;
-            int cursor = 0;
-            for (int i = 0; i < n; i++)
-            {
-                int k = section1AtTop ? (n - 1 - i) : i;
-                int size = baseSize + (k < rem ? 1 : 0);
-                starts[k] = cursor;
-                ends[k] = cursor + size - 1;
-                cursor += size;
-            }
-        }
-        else
-        {
-            for (int k = 0; k < n; k++)
-            {
-                GameSection gs = gameSections[k] ?? new GameSection();
-                starts[k] = Mathf.Max(0, gs.startPairIndex);
-                ends[k] = Mathf.Min(total - 1, gs.startPairIndex + Mathf.Max(0, gs.pairCount) - 1);
-            }
-        }
-
-        for (int k = 0; k < n; k++)
-        {
-            GameSection gs = gameSections[k] ?? new GameSection();
-            _sections.Add(new SectionRuntime
-            {
-                index = k,
-                name = string.IsNullOrEmpty(gs.name) ? $"Section {k + 1}" : gs.name,
-                start = starts[k],
-                end = ends[k],
-                missing = Mathf.Max(0, gs.missingBases),
-                moveDistance = gs.moveDownDistanceOverride,
-                root = null,
-            });
-        }
-
-        if (total < n)
-            Debug.LogWarning($"DNASimulator: only {total} base pair(s) exist but {n} sections are configured. " +
-                             "Increase Count / Pairs Per Step so every section has pairs.", this);
-    }
-
-    private int GetSectionIndexForPair(int p)
-    {
-        for (int i = 0; i < _sections.Count; i++)
-            if (p >= _sections[i].start && p <= _sections[i].end) return i;
-        return -1;
-    }
-
-    private void CreateSectionRoots()
-    {
-        for (int i = 0; i < _sections.Count; i++)
-        {
-            var go = new GameObject($"{SectionRootName}_{i}");
-            go.transform.SetParent(_container, false); // identity: pivots keep their exact container-local positions
-            MarkTemporary(go);
-            _sections[i].root = go.transform;
-        }
-    }
-
-    private Transform GetSectionRootForPair(int p)
-    {
-        for (int i = 0; i < _sections.Count; i++)
-        {
-            SectionRuntime s = _sections[i];
-            if (s.root != null && p >= s.start && p <= s.end) return s.root;
-        }
-        return _container;
-    }
-
-    /// <summary>A strand piece belongs to the section that contains the pair at the piece's vertical center.</summary>
-    private Transform GetSectionRootForStrand(int stepIndex)
-    {
-        int total = TotalPairs;
-        int p = Mathf.Clamp(Mathf.RoundToInt((stepIndex + 0.5f - pairHeightOffset) * pairsPerStep - 0.5f), 0, total - 1);
-        return GetSectionRootForPair(p);
-    }
-
-    /// <summary>Builds the ordered target list: Section 1 first, and inside a section from the lowest pair index up.</summary>
-    private void BuildTargets()
-    {
-        _targets.Clear();
-        _targetIndex = -1;
-        _currentTarget = null;
-
-        for (int s = 0; s < _sections.Count; s++)
-        {
-            SectionRuntime sec = _sections[s];
-            for (int p = sec.start; p <= sec.end; p++)
-            {
-                if (_slots.TryGetValue(p, out MissingSlot slot))
-                {
-                    slot.sectionIndex = s;
-                    _targets.Add(slot);
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------ Game routines
-    private IEnumerator GameStartRoutine()
-    {
-        _state = GameState.MovingCamera;
-        yield return MoveCameraRoutine();
-
-        AdvanceToNextTarget();
-    }
-
-    /// <summary>Selects the next missing base, or completes the game if there are none left.</summary>
-    private void AdvanceToNextTarget()
-    {
-        _targetIndex++;
-
-        if (_targetIndex >= _targets.Count)
-        {
-            CompleteGame();
-            return;
-        }
-
-        _currentTarget = _targets[_targetIndex];
-        ApplyHighlight(_currentTarget);
-        _state = GameState.Playing;
-    }
-
-    private void CompleteGame()
-    {
-        _currentTarget = null;
-        _state = GameState.Completed;
-        OnGameCompleted?.Invoke();
-    }
-
-    private IEnumerator AnswerRoutine(char chosen)
-    {
-        MissingSlot t = _currentTarget;
-        ClearHighlight(t);
-
-        Button pressed = GetButton(chosen);
-        Button correctButton = GetButton(t.correctLetter);
-
-        if (chosen == t.correctLetter)
-        {
-            // ---- CORRECT: fill the slot, green flash, restore original color ----
-            FlashButton(pressed, correctFlashColor, correctFlashDuration);
-            GameObject go = RevealBase(t, t.correctLetter);
-            OnAnswerCorrect?.Invoke();
-            yield return FlashObjectRoutine(go, correctFlashColor, correctFlashDuration);
-        }
-        else
-        {
-            // ---- WRONG: show the chosen (wrong) base in red, remove it, then show the right one in green ----
-            FlashButton(pressed, wrongFlashColor, wrongFlashDuration);
-            GameObject wrongGo = RevealBase(t, chosen);
-            OnAnswerWrong?.Invoke();
-            yield return FlashObjectRoutine(wrongGo, wrongFlashColor, wrongFlashDuration);
-
-            DestroySpawnedBase(wrongGo);
-            t.currentGo = null;
-
-            _state = GameState.FlashingCorrect;
-            FlashButton(correctButton, correctFlashColor, correctFlashDuration);
-            GameObject rightGo = RevealBase(t, t.correctLetter);
-            yield return FlashObjectRoutine(rightGo, correctFlashColor, correctFlashDuration);
-        }
-
-        // ---- Move the section down, then pick the next target ----
-        _state = GameState.MovingSection;
-        yield return MoveSectionsRoutine(t.sectionIndex);
-
-        AdvanceToNextTarget();
-    }
-
-    /// <summary>Spawns a base of the given letter into a missing slot using the SAME placement math as the
-    /// normal generator (PlaceChild), without duplicating sugar / phosphate.</summary>
-    private GameObject RevealBase(MissingSlot t, char letter)
-    {
-        GameObject src = GetBasePrefab(letter);
-        if (src == null || t.parent == null)
-        {
-            Debug.LogWarning($"DNASimulator: cannot spawn base '{letter}' (prefab or pair pivot missing).", this);
-            return null;
-        }
-
-        string nm = $"{src.name}_Pair_{t.pairIndex}_{(t.isLeft ? "L" : "R")}";
-        GameObject go = PlaceChild(src, t.parent, t.localPos, t.side, t.elemDist, t.baseRot, t.elemRot,
-                                   t.flipped, nm, letter, spawnBase: true, spawnBackbone: false);
-        t.currentGo = go;
-        return go;
-    }
-
-    private void DestroySpawnedBase(GameObject go)
-    {
-        if (go == null) return;
-
-        RestoreObject(go);
-
-        // The base and its interior element were both added to 'spawned'.
-        foreach (Transform tr in go.GetComponentsInChildren<Transform>(true))
-            spawned.Remove(tr.gameObject);
-
-        Destroy(go);
-    }
-
-    // ------------------------------------------------------------------ Highlight
-    private void ApplyHighlight(MissingSlot t)
-    {
-        if (!highlightActiveTarget || t == null || t.visibleGo == null) return;
-        TintObject(t.visibleGo, targetHighlightColor);
-    }
-
-    private void ClearHighlight(MissingSlot t)
-    {
-        if (t == null || t.visibleGo == null) return;
-        RestoreObject(t.visibleGo);
-    }
-
-    // ------------------------------------------------------------------ Material feedback
-    /// <summary>Tints an object, waits, then restores its exact original colors.</summary>
-    private IEnumerator FlashObjectRoutine(GameObject go, Color color, float duration)
-    {
-        if (go == null)
-        {
-            yield return new WaitForSeconds(duration);
-            yield break;
-        }
-
-        TintObject(go, color);
-        yield return new WaitForSeconds(duration);
-        RestoreObject(go);
-    }
-
-    /// <summary>Sets the color of every renderer material under 'go'. The ORIGINAL color of every
-    /// _BaseColor / _Color property is saved the first time, and materials are per-renderer INSTANCES
-    /// (renderer.materials), so the shared prefab materials are never modified. Alpha is preserved.</summary>
-    private void TintObject(GameObject go, Color color)
-    {
-        if (go == null) return;
-
-        if (!_tints.TryGetValue(go, out List<TintRecord> records))
-        {
-            records = new List<TintRecord>();
-            foreach (Renderer r in go.GetComponentsInChildren<Renderer>(true))
-            {
-                Material[] mats = r.materials; // creates instances - does not touch the shared prefab materials
-                for (int i = 0; i < mats.Length; i++)
-                {
-                    Material m = mats[i];
-                    if (m == null) continue;
-
-                    if (m.HasProperty(BaseColorId))
-                        records.Add(new TintRecord { mat = m, propId = BaseColorId, original = m.GetColor(BaseColorId) });
-                    if (m.HasProperty(ColorId))
-                        records.Add(new TintRecord { mat = m, propId = ColorId, original = m.GetColor(ColorId) });
-                }
-            }
-            _tints[go] = records;
-        }
-
-        for (int i = 0; i < records.Count; i++)
-        {
-            TintRecord rec = records[i];
-            if (rec.mat == null) continue;
-            rec.mat.SetColor(rec.propId, new Color(color.r, color.g, color.b, rec.original.a));
-        }
-    }
-
-    /// <summary>Restores the exact original colors saved by TintObject.</summary>
-    private void RestoreObject(GameObject go)
-    {
-        if (go == null) return;
-        if (!_tints.TryGetValue(go, out List<TintRecord> records)) return;
-
-        for (int i = 0; i < records.Count; i++)
-        {
-            TintRecord rec = records[i];
-            if (rec.mat != null) rec.mat.SetColor(rec.propId, rec.original);
-        }
-        _tints.Remove(go);
-    }
-
-    private void RestoreAllTints()
-    {
-        foreach (var kv in _tints)
-        {
-            List<TintRecord> records = kv.Value;
-            for (int i = 0; i < records.Count; i++)
-                if (records[i].mat != null) records[i].mat.SetColor(records[i].propId, records[i].original);
-        }
-        _tints.Clear();
-    }
-
-    // ------------------------------------------------------------------ Section movement
-    /// <summary>Smoothly slides the finished section (or sections, depending on Section Move Mode) down.</summary>
-    private IEnumerator MoveSectionsRoutine(int sectionIndex)
-    {
-        var roots = new List<Transform>();
-        float distance = strandMoveDownDistance;
-
-        if (sectionIndex >= 0 && sectionIndex < _sections.Count && _sections[sectionIndex].moveDistance >= 0f)
-            distance = _sections[sectionIndex].moveDistance;
-
-        switch (sectionMoveMode)
-        {
-            case SectionMoveMode.CurrentSectionOnly:
-                if (sectionIndex >= 0 && sectionIndex < _sections.Count && _sections[sectionIndex].root != null)
-                    roots.Add(_sections[sectionIndex].root);
-                break;
-
-            case SectionMoveMode.CurrentAndFollowingSections:
-                for (int i = Mathf.Max(0, sectionIndex); i < _sections.Count; i++)
-                    if (_sections[i].root != null) roots.Add(_sections[i].root);
-                break;
-
-            case SectionMoveMode.WholeDNA:
-                if (_container != null) roots.Add(_container);
-                break;
-        }
-
-        if (roots.Count == 0 || distance <= 0f) yield break;
-
-        var startPositions = new Vector3[roots.Count];
-        var endPositions = new Vector3[roots.Count];
-        for (int i = 0; i < roots.Count; i++)
-        {
-            startPositions[i] = roots[i].localPosition;
-            endPositions[i] = startPositions[i] + Vector3.down * distance; // down in the DNA's local space
-        }
-
-        float duration = Mathf.Max(0f, strandMoveDuration);
-        float elapsed = 0f;
-
-        while (elapsed < duration)
-        {
-            elapsed += Time.deltaTime;
-            float s = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / duration));
-            for (int i = 0; i < roots.Count; i++)
-                if (roots[i] != null) roots[i].localPosition = Vector3.Lerp(startPositions[i], endPositions[i], s);
-            yield return null;
-        }
-
-        for (int i = 0; i < roots.Count; i++)
-            if (roots[i] != null) roots[i].localPosition = endPositions[i];
-    }
-
-    // ------------------------------------------------------------------ Camera
-    private Camera ResolveGameCamera()
-    {
-        if (gameCamera != null) return gameCamera;
-        return Camera.main;
-    }
-
-    /// <summary>World-space center of the generated DNA (renderer bounds), with a computed fallback.</summary>
-    private Vector3 GetDnaCenterWorld()
-    {
-        if (_container != null)
-        {
-            Renderer[] rends = _container.GetComponentsInChildren<Renderer>();
-            bool has = false;
-            Bounds b = default;
-            for (int i = 0; i < rends.Length; i++)
-            {
-                if (!has) { b = rends[i].bounds; has = true; }
-                else b.Encapsulate(rends[i].bounds);
-            }
-            if (has) return b.center;
-        }
-
-        float stepHeight = GetStepHeight();
-        float totalHeight = count * stepHeight + (count - 1) * stackGap;
-        return transform.TransformPoint(spawnPosition + Vector3.up * (totalHeight * 0.5f));
-    }
-
-    /// <summary>Smoothly moves / rotates the camera to look at the DNA center from the front.
-    /// The DNA itself is never rotated.</summary>
-    private IEnumerator MoveCameraRoutine()
-    {
-        Camera cam = ResolveGameCamera();
-        if (cam == null)
-        {
-            Debug.LogWarning("DNASimulator: no Game Camera assigned and no Camera.main found - the camera will not move.", this);
-            yield break;
-        }
-
-        Transform ct = cam.transform;
-
-        // Remember where the camera was so ExitGameMode() can put it back.
-        if (!_camSaved)
-        {
-            _camUsed = cam;
-            _camOrigPos = ct.position;
-            _camOrigRot = ct.rotation;
-            _camSaved = true;
-        }
-
-        Vector3 center = GetDnaCenterWorld();
-        Vector3 targetPos = center + transform.TransformVector(gameCameraOffset);
-        Vector3 lookDir = center - targetPos;
-        if (lookDir.sqrMagnitude < 1e-6f) lookDir = transform.forward;
-        Quaternion targetRot = Quaternion.LookRotation(lookDir, transform.up);
-
-        Vector3 startPos = ct.position;
-        Quaternion startRot = ct.rotation;
-
-        float duration = Mathf.Max(0f, cameraMoveDuration);
-        if (duration <= 0f)
-        {
-            ct.SetPositionAndRotation(targetPos, targetRot);
-            yield break;
-        }
-
-        float elapsed = 0f;
-        while (elapsed < duration)
-        {
-            elapsed += Time.deltaTime;
-            float s = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / duration));
-            ct.SetPositionAndRotation(Vector3.Lerp(startPos, targetPos, s), Quaternion.Slerp(startRot, targetRot, s));
-            yield return null;
-        }
-
-        ct.SetPositionAndRotation(targetPos, targetRot);
-    }
-
-    private void RestoreCamera()
-    {
-        if (!_camSaved) return;
-        if (_camUsed != null) _camUsed.transform.SetPositionAndRotation(_camOrigPos, _camOrigRot);
-        _camSaved = false;
-        _camUsed = null;
-    }
-
-    // ------------------------------------------------------------------ Cancel / reset
-    /// <summary>Stops every game routine and clears all game data. Does NOT respawn and does NOT move the camera.</summary>
-    private void CancelGameInternal()
-    {
-        StopAllCoroutines();
-        RestoreAllTints();
-        RestoreAllButtonColors();
-
-        _state = GameState.NotStarted;
-        _gameModeActive = false;
-        _currentTarget = null;
-        _targetIndex = -1;
-        _targets.Clear();
-        _slots.Clear();
-        _sections.Clear();
-        _missingSidePlan.Clear();
+        return h;
     }
 
     // =================================================================== Gizmos
@@ -1668,9 +1595,9 @@ public class DNASimulator2 : MonoBehaviour
 
         float stepHeight = GetStepHeight();
         float step = stepHeight + stackGap;
-        int steps = Mathf.Max(1, count);
+        int steps = Mathf.Max(0, count);
 
-        // Strand (green -> cyan)
+        // Strand (green -> cyan). Draws nothing when count is 0.
         for (int i = 0; i < steps; i++)
         {
             Vector3 start = transform.TransformPoint(spawnPosition + Vector3.up * (i * step));
@@ -1682,10 +1609,21 @@ public class DNASimulator2 : MonoBehaviour
             Gizmos.DrawSphere(end, 0.1f);
         }
 
-        if (!spawnBasePairs) return;
+        if (!spawnBasePairs || count <= 0) return;
 
-        // Base pair preview. The sequence is random at spawn time, so this uses the baseline
-        // rotation and distance - an approximation, not an exact match.
+        // Animation boundaries (top = yellow, bottom = red)
+        GetBounds(step, out float bottomY, out float topY);
+        float halfW = Mathf.Max(0.5f, pairHalfLength * 1.5f);
+        Vector3 bl = transform.TransformPoint(new Vector3(spawnPosition.x - halfW, bottomY, spawnPosition.z));
+        Vector3 br = transform.TransformPoint(new Vector3(spawnPosition.x + halfW, bottomY, spawnPosition.z));
+        Vector3 tl = transform.TransformPoint(new Vector3(spawnPosition.x - halfW, topY, spawnPosition.z));
+        Vector3 tr = transform.TransformPoint(new Vector3(spawnPosition.x + halfW, topY, spawnPosition.z));
+        Gizmos.color = Color.red;
+        Gizmos.DrawLine(bl, br);
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawLine(tl, tr);
+
+        // Base pair preview (baseline rotation / distance - the real sequence is random).
         int total = TotalPairs;
         for (int p = 0; p < total; p++)
         {
