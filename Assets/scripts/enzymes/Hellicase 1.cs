@@ -19,6 +19,8 @@ using UnityEditor;
 /// • On start (and live in EDIT MODE) the strand is already filled with RANDOM bases from the bottom to the top
 ///   boundary. After that, every pair deleted by the source feeds in at the top, one base at a time.
 ///
+/// • NEW: raises BaseDeleted(char) every time a base is removed at the bottom boundary.
+///
 /// NOTE: file name must be "DNAStraightReplicationSimulator.cs".
 /// </summary>
 [DisallowMultipleComponent]
@@ -162,6 +164,12 @@ public class DNAStraightReplicationSimulator : MonoBehaviour
     public bool liveUpdateInEditor = true;
     public bool drawGizmos = true;
 
+    // ------------------------------------------------------------------ Deletion event (NEW)
+    /// <summary>Raised once for every base removed at the bottom boundary, oldest first.
+    /// Not raised by ClearGenerated / rebuilds.</summary>
+    public event System.Action<char> BaseDeleted;
+    private readonly List<char> _deletedThisFrame = new();
+
     // ------------------------------------------------------------------ Runtime
     private const string ContainerName = "__DNA_Straight_Generated";
     private const string PairPivotName = "__StraightPairPivot";
@@ -192,13 +200,14 @@ public class DNAStraightReplicationSimulator : MonoBehaviour
     public float EffectiveFallSpeed =>
         inheritFallSpeedFromSource && source != null ? source.fallingSpeed : fallSpeed;
 
-    private float EffStepHeight => copySpacingFromSource && source != null ? source.StepHeight : stepHeight;
-    private float EffPairsPerStep => Mathf.Max(0.01f, copySpacingFromSource && source != null ? source.pairsPerStep : pairsPerStep);
-    private float EffStackGap => copySpacingFromSource && source != null ? source.stackGap : stackGap;
+    // Now PUBLIC so other scripts can inherit these values.
+    public float EffStepHeight => copySpacingFromSource && source != null ? source.StepHeight : stepHeight;
+    public float EffPairsPerStep => Mathf.Max(0.01f, copySpacingFromSource && source != null ? source.pairsPerStep : pairsPerStep);
+    public float EffStackGap => copySpacingFromSource && source != null ? source.stackGap : stackGap;
 
-    private Vector3 EffElementScale => matchSourceScales && source != null ? source.elementLocalScale : elementLocalScale;
-    private Vector3 EffSugarScale => matchSourceScales && source != null ? source.sugarLocalScale : sugarLocalScale;
-    private Vector3 EffPhosphateScale => matchSourceScales && source != null ? source.phosphateLocalScale : phosphateLocalScale;
+    public Vector3 EffElementScale => matchSourceScales && source != null ? source.elementLocalScale : elementLocalScale;
+    public Vector3 EffSugarScale => matchSourceScales && source != null ? source.sugarLocalScale : sugarLocalScale;
+    public Vector3 EffPhosphateScale => matchSourceScales && source != null ? source.phosphateLocalScale : phosphateLocalScale;
 
     /// <summary>Scale factor applied to each pair pivot so its content has the same world size as on the source.</summary>
     private Vector3 PivotScale
@@ -280,15 +289,21 @@ public class DNAStraightReplicationSimulator : MonoBehaviour
             }
         }
 
+        // Despawn at the bottom and record the deleted letters (NEW).
+        _deletedThisFrame.Clear();
         for (int i = _pairs.Count - 1; i >= 0; i--)
         {
             PairRuntime pr = _pairs[i];
             if (pr.liveY < bottomDespawnHeight)
             {
                 if (pr.pivot != null) Destroy(pr.pivot.gameObject);
+                _deletedThisFrame.Add(pr.letter);
                 _pairs.RemoveAt(i);
             }
         }
+        // The loop runs newest to oldest, so report in reverse to keep deletion order.
+        for (int i = _deletedThisFrame.Count - 1; i >= 0; i--)
+            BaseDeleted?.Invoke(_deletedThisFrame[i]);
 
         TryDrainQueue();
     }
